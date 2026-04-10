@@ -60,15 +60,12 @@ def sort_events_by_timestamp(events: np.ndarray) -> np.ndarray:
     order = np.argsort(ts, kind="stable")
     return events[order]
 
-
 def events_to_preview_frame(
     events: np.ndarray,
     width: int,
     height: int,
     contrast: float = 4.0,
-    step: float = 2.0,
-    neighbor_radius: int = 1,
-    min_neighbors: int = 3,
+    step: float = 1.0,
 ) -> np.ndarray:
     frame = np.full((height, width), 128.0, dtype=np.float32)
 
@@ -83,24 +80,6 @@ def events_to_preview_frame(
     xs = xs[valid]
     ys = ys[valid]
     tp = tp[valid]
-
-    if xs.size == 0:
-        return frame.astype(np.uint8)
-
-    # Per-pixel activity map
-    counts = np.zeros((height, width), dtype=np.float32)
-    np.add.at(counts, (ys, xs), 1.0)
-
-    # Simple neighborhood support using box filter
-    k = 2 * neighbor_radius + 1
-    neighborhood = cv2.blur(counts, (k, k), borderType=cv2.BORDER_CONSTANT) * (k * k)
-
-    # Keep only events that have enough local support
-    keep = neighborhood[ys, xs] >= float(min_neighbors)
-
-    xs = xs[keep]
-    ys = ys[keep]
-    tp = tp[keep]
 
     if xs.size == 0:
         return frame.astype(np.uint8)
@@ -120,89 +99,6 @@ def events_to_preview_frame(
     np.clip(frame, 0, 255, out=frame)
     return frame.astype(np.uint8)
 
-def stc_filter_events(
-    events: np.ndarray,
-    width: int,
-    height: int,
-    dt_us: int = 8000,
-    radius: int = 1,
-    require_same_polarity: bool = False,
-    refractory_us: int = 0,
-) -> np.ndarray:
-    if events.size == 0:
-        return events
-
-    ts = (
-        events[:, 1].astype(np.int64) * 1_000_000
-        + events[:, 2].astype(np.int64) * 1_000
-        + events[:, 3].astype(np.int64)
-    )
-
-    xs = events[:, 4].astype(np.int32)
-    ys = events[:, 5].astype(np.int32)
-    ps = events[:, 0].astype(np.int32)
-
-    valid = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
-    xs = xs[valid]
-    ys = ys[valid]
-    ps = ps[valid]
-    ts = ts[valid]
-    ev_valid = events[valid]
-
-    if xs.size == 0:
-        return ev_valid[:0]
-
-    if require_same_polarity:
-        last_seen = np.full((height, width, 2), -10**15, dtype=np.int64)
-        last_kept = np.full((height, width, 2), -10**15, dtype=np.int64)
-    else:
-        last_seen = np.full((height, width), -10**15, dtype=np.int64)
-        last_kept = np.full((height, width), -10**15, dtype=np.int64)
-
-    keep = np.zeros(xs.shape[0], dtype=bool)
-
-    for i in range(xs.shape[0]):
-        x = xs[i]
-        y = ys[i]
-        t = ts[i]
-        p = 1 if ps[i] == 1 else 0
-
-        x0 = max(0, x - radius)
-        x1 = min(width, x + radius + 1)
-        y0 = max(0, y - radius)
-        y1 = min(height, y + radius + 1)
-
-        if require_same_polarity:
-            # refractory uses kept events
-            if refractory_us > 0 and (t - last_kept[y, x, p] < refractory_us):
-                last_seen[y, x, p] = t
-                continue
-
-            neighborhood_last = last_seen[y0:y1, x0:x1, p]
-        else:
-            if refractory_us > 0 and (t - last_kept[y, x] < refractory_us):
-                last_seen[y, x] = t
-                continue
-
-            neighborhood_last = last_seen[y0:y1, x0:x1]
-
-        # exclude self from support by requiring a previous event strictly earlier
-        support = np.any((t - neighborhood_last > 0) & (t - neighborhood_last <= dt_us))
-
-        if support:
-            keep[i] = True
-            if require_same_polarity:
-                last_kept[y, x, p] = t
-            else:
-                last_kept[y, x] = t
-
-        # IMPORTANT: update seen-map regardless of whether event was kept
-        if require_same_polarity:
-            last_seen[y, x, p] = t
-        else:
-            last_seen[y, x] = t
-
-    return ev_valid[keep]
 
 def main():
     ap = argparse.ArgumentParser(description="GenX320 raw event stream receiver")
@@ -314,33 +210,17 @@ def main():
                     if preview_buffer:
                         chunk = np.concatenate([ev for (_, ev) in preview_buffer], axis=0)
 
-                        # IMPORTANT: sort by reconstructed event timestamp before filtering/rendering
-                        chunk = sort_events_by_timestamp(chunk)
-                        chunk = stc_filter_events(
-                            chunk,
-                            W,
-                            H,
-                            dt_us=8000,
-                            radius=1,
-                            require_same_polarity=False,
-                            refractory_us=0,
-                        )
-                        frame = events_to_preview_frame(chunk, W, H)
-
-                        if args.resize > 1:
-                            frame = cv2.resize(
-                                frame,
-                                (W * args.resize, H * args.resize),
-                                interpolation=cv2.INTER_NEAREST,
-                            )
-
+                        
+                        frame = events_to_preview_frame(chunk, W, H, contrast=4.0, step=1.0)
+                        frame = cv2.blur(frame, (2, 2))
+                        frame = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_NEAREST)
                         cv2.imshow("GenX320 event preview", frame)
 
                         key = cv2.waitKey(1) & 0xFF
                         if key == 27 or key == ord('q'):
                             break
 
-                    last_preview_time = now
+                        last_preview_time = now
 
     finally:
         ser.close()

@@ -14,8 +14,9 @@ from cv_bridge import CvBridge
 
 class OpenMVCamNode(Node):
     MAGIC = b'OMV1'
-    HEADER_FMT = '<LLL'   # width, height, payload_len
+    HEADER_FMT = '<LLLL'   # width, height, payload_len, format
     HEADER_SIZE = 4 + struct.calcsize(HEADER_FMT)
+    STATS_PRINT_PERIOD_S = 2.0
 
     def __init__(self):
         super().__init__('openmv_cam')
@@ -39,6 +40,7 @@ class OpenMVCamNode(Node):
         self._stop_event = threading.Event()
         self._stream_active = False
         self._stream_start_time = None
+        self._reset_stream_stats()
 
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
@@ -46,6 +48,13 @@ class OpenMVCamNode(Node):
         self.get_logger().info(
             f"OpenMV serial on {self.port_name} @ {self.baud}, publishing {self.topic}"
         )
+
+    def _reset_stream_stats(self):
+        self._frames_received = 0
+        self._payload_bytes_total = 0
+        self._protocol_bytes_total = 0
+        self._stats_start_time = None
+        self._last_stats_print_time = None
 
     def _open_serial(self):
         try:
@@ -92,23 +101,36 @@ class OpenMVCamNode(Node):
                 return
         raise RuntimeError("Stop requested.")
 
+    def unpack_4bit_to_mono8(self,buf, width, height):
+
+        packed = np.frombuffer(buf, dtype=np.uint8)
+
+        hi = packed >> 4
+        lo = packed & 0x0F
+
+        out = np.empty(packed.size * 2, dtype=np.uint8)
+        out[0::2] = hi * 17
+        out[1::2] = lo * 17
+
+        return out.reshape((height, width))
+
     def _read_frame(self) -> np.ndarray:
         self._read_until_magic()
 
         header_rest = self._read_exactly(struct.calcsize(self.HEADER_FMT))
-        width, height, payload_len = struct.unpack(self.HEADER_FMT, header_rest)
-
-        if width <= 0 or height <= 0 or width > 10000 or height > 10000:
-            raise RuntimeError(f"Invalid image size: {width}x{height}")
-
-        expected_len = width * height
-        if payload_len != expected_len:
-            raise RuntimeError(
-                f"Invalid payload length: got {payload_len}, expected {expected_len}"
-            )
+        width, height, payload_len, fmt = struct.unpack(self.HEADER_FMT, header_rest)
 
         buf = self._read_exactly(payload_len)
-        img = np.frombuffer(buf, dtype=np.uint8).reshape((height, width))
+
+        if fmt == 0:  # mono8
+            img = np.frombuffer(buf, dtype=np.uint8).reshape((height, width))
+
+        elif fmt == 1:  # 4-bit packed
+            img = self.unpack_4bit_to_mono8(buf, width, height)
+
+        else:
+            raise RuntimeError(f"Unknown format: {fmt}")
+
         return img
 
     def _publish_image(self, img: np.ndarray):
@@ -120,6 +142,34 @@ class OpenMVCamNode(Node):
         msg.header.frame_id = self.frame_id
         self.pub_raw.publish(msg)
 
+    def _maybe_print_stats(self):
+        if self._stats_start_time is None or self._last_stats_print_time is None:
+            return
+
+        now = time.monotonic()
+        if (now - self._last_stats_print_time) < self.STATS_PRINT_PERIOD_S:
+            return
+
+        elapsed_time = now - self._stats_start_time
+        if elapsed_time <= 0.0:
+            return
+
+        payload_MBps = (self._payload_bytes_total / elapsed_time) / (1024.0 * 1024.0)
+        protocol_MBps = (self._protocol_bytes_total / elapsed_time) / (1024.0 * 1024.0)
+        effective_fps = self._frames_received / elapsed_time
+
+        self.get_logger().info(
+            "\n"
+            "===== STREAM STATS =====\n"
+            f"frames_received     : {self._frames_received}\n"
+            f"elapsed_time        : {elapsed_time:.2f} s\n"
+            f"effective_fps       : {effective_fps:.1f}\n"
+            f"payload_MBps        : {payload_MBps:.3f}\n"
+            f"protocol_MBps       : {protocol_MBps:.3f}\n"
+            "========================"
+        )
+        self._last_stats_print_time = now
+
     def _reader_loop(self):
         while not self._stop_event.is_set():
             try:
@@ -129,7 +179,16 @@ class OpenMVCamNode(Node):
                 if not self._stream_active:
                     self._stream_active = True
                     self._stream_start_time = time.monotonic()
+                    self._reset_stream_stats()
+                    self._stats_start_time = self._stream_start_time
+                    self._last_stats_print_time = self._stats_start_time
                     self.get_logger().info("Frame stream started")
+
+                frame_payload_bytes = int(img.nbytes)
+                self._frames_received += 1
+                self._payload_bytes_total += frame_payload_bytes
+                self._protocol_bytes_total += frame_payload_bytes + self.HEADER_SIZE
+                self._maybe_print_stats()
 
             except RuntimeError as e:
                 if "Stop requested" in str(e):
@@ -142,6 +201,7 @@ class OpenMVCamNode(Node):
                     )
                     self._stream_active = False
                     self._stream_start_time = None
+                    self._reset_stream_stats()
 
                 self.get_logger().warn(f"Frame read failed: {e}")
                 time.sleep(0.05)

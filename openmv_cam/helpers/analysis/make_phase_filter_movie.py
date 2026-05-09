@@ -5,6 +5,7 @@ Generate side-by-side comparison video of raw vs. phase-filtered event frames.
 Requires: numpy, opencv-python
 """
 import argparse
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -221,15 +222,149 @@ def render_frame(counts: np.ndarray) -> np.ndarray:
     return normalized
 
 
+def local_motion_filter(
+    points: np.ndarray,
+    width: int,
+    height: int,
+    radius_px: int,
+    window_ms: float,
+    min_neighbors: int,
+    min_coherence: float,
+    max_speed_px_per_ms: float,
+    support_only: bool,
+):
+    """
+    Keep events that are supported by locally coherent recent motion.
+
+    Returns:
+        kept_points, keep_mask, valid_neighbor_counts
+    """
+    if len(points) == 0:
+        return points, np.zeros((0,), dtype=bool), np.zeros((0,), dtype=np.int32)
+
+    if radius_px <= 0 or window_ms <= 0:
+        return (
+            np.zeros((0, 3), dtype=points.dtype),
+            np.zeros(len(points), dtype=bool),
+            np.zeros(len(points), dtype=np.int32),
+        )
+
+    # Ensure processing in temporal order for previous-events-only logic.
+    order = np.argsort(points[:, 2], kind="stable")
+    pts = points[order]
+
+    window_us = int(window_ms * 1000.0)
+    cell_size = max(1, radius_px)
+    radius_sq = radius_px * radius_px
+
+    # Recent-event buffer and spatial hash to avoid full O(N^2) neighborhood scans.
+    recent = deque()  # entries: (global_idx, x, y, t_us, cell_key)
+    grid = {}  # cell_key -> deque of entries
+
+    keep_sorted = np.zeros(len(pts), dtype=bool)
+    neighbor_count_sorted = np.zeros(len(pts), dtype=np.int32)
+
+    for i in range(len(pts)):
+        xi = int(pts[i, 0])
+        yi = int(pts[i, 1])
+        ti = int(pts[i, 2])
+
+        # Drop expired events from both recent queue and grid buckets.
+        cutoff = ti - window_us
+        while recent and recent[0][3] < cutoff:
+            old = recent.popleft()
+            old_cell = old[4]
+            bucket = grid.get(old_cell)
+            if bucket is not None:
+                while bucket and bucket[0][0] <= old[0]:
+                    popped = bucket.popleft()
+                    if popped[0] == old[0]:
+                        break
+                if not bucket:
+                    grid.pop(old_cell, None)
+
+        cell_x = xi // cell_size
+        cell_y = yi // cell_size
+        search_r = 1
+
+        cand = []
+        for gy in range(cell_y - search_r, cell_y + search_r + 1):
+            for gx in range(cell_x - search_r, cell_x + search_r + 1):
+                bucket = grid.get((gx, gy))
+                if bucket is not None:
+                    cand.extend(bucket)
+
+        # Previous events only + local spatiotemporal support.
+        offsets = []
+        for entry in cand:
+            xj, yj, tj = entry[1], entry[2], entry[3]
+            if tj >= ti:
+                continue
+            if ti - tj > window_us:
+                continue
+            dx = xi - xj
+            dy = yi - yj
+            if abs(dx) > radius_px or abs(dy) > radius_px:
+                continue
+            if dx * dx + dy * dy > radius_sq:
+                continue
+            dt_ms = (ti - tj) / 1000.0
+            if dt_ms <= 0:
+                continue
+
+            speed = np.hypot(dx, dy) / dt_ms
+            if speed > max_speed_px_per_ms:
+                continue
+
+            offsets.append((dx, dy))
+
+        valid_neighbors = len(offsets)
+        neighbor_count_sorted[i] = valid_neighbors
+
+        if valid_neighbors >= min_neighbors:
+            if support_only:
+                keep_sorted[i] = True
+            else:
+                offsets_arr = np.asarray(offsets, dtype=np.float32)
+                centered = offsets_arr - offsets_arr.mean(axis=0, keepdims=True)
+                denom = max(valid_neighbors - 1, 1)
+                cov = (centered.T @ centered) / float(denom)
+                eigvals = np.linalg.eigvalsh(cov)
+                lambda1 = float(eigvals[-1])
+                lambda2 = float(eigvals[-2])
+                anisotropy = lambda1 / (lambda1 + lambda2 + 1e-6)
+                if anisotropy >= min_coherence:
+                    keep_sorted[i] = True
+
+        # Insert current event after decision so it cannot support itself.
+        cell_key = (cell_x, cell_y)
+        entry = (i, xi, yi, ti, cell_key)
+        recent.append(entry)
+        if cell_key not in grid:
+            grid[cell_key] = deque()
+        grid[cell_key].append(entry)
+
+        if (i + 1) % 50000 == 0:
+            print(f"[INFO] Motion filter progress: {i + 1}/{len(pts)} events")
+
+    # Map keep mask back to original ordering.
+    keep_mask = np.zeros(len(points), dtype=bool)
+    keep_mask[order] = keep_sorted
+    neighbor_count = np.zeros(len(points), dtype=np.int32)
+    neighbor_count[order] = neighbor_count_sorted
+
+    return points[keep_mask], keep_mask, neighbor_count
+
+
 def write_comparison_movie(
     raw_points: np.ndarray,
-    filtered_points: np.ndarray,
+    motion_filtered_points: np.ndarray,
     save_path: Path,
     fps: int,
     width: int,
     height: int,
 ) -> int:
-    """Generate side-by-side comparison video of raw vs. filtered events."""
+    """Generate side-by-side comparison video of raw vs. local-motion-filtered events."""
     try:
         import cv2
     except ImportError:
@@ -241,9 +376,9 @@ def write_comparison_movie(
         print("[WARN] No raw events; generating empty video.")
         raw_points = np.zeros((0, 3), dtype=np.int64)
 
-    if len(filtered_points) == 0:
-        print("[WARN] No filtered events in output.")
-        filtered_points = np.zeros((0, 3), dtype=np.int64)
+    if len(motion_filtered_points) == 0:
+        print("[WARN] No motion-filtered events in output.")
+        motion_filtered_points = np.zeros((0, 3), dtype=np.int64)
 
     # Determine video duration from raw events (full recording)
     if len(raw_points) > 0:
@@ -282,12 +417,12 @@ def write_comparison_movie(
         raw_mask = (raw_points[:, 2] >= frame_start_us) & (
             raw_points[:, 2] < frame_end_us
         )
-        filtered_mask = (filtered_points[:, 2] >= frame_start_us) & (
-            filtered_points[:, 2] < frame_end_us
+        filtered_mask = (motion_filtered_points[:, 2] >= frame_start_us) & (
+            motion_filtered_points[:, 2] < frame_end_us
         )
 
         raw_frame_events = raw_points[raw_mask]
-        filtered_frame_events = filtered_points[filtered_mask]
+        filtered_frame_events = motion_filtered_points[filtered_mask]
 
         # Convert to images
         raw_counts = events_to_frame(raw_frame_events, width, height)
@@ -308,11 +443,18 @@ def write_comparison_movie(
 
         cv2.putText(raw_bgr, "raw", (10, 25), font, font_scale, color, thickness)
         cv2.putText(
-            filtered_bgr, "phase filtered", (10, 25), font, font_scale, color, thickness
+            filtered_bgr,
+            "local motion filtered",
+            (10, 25),
+            font,
+            font_scale,
+            color,
+            thickness,
         )
 
         # Concatenate left and right
         comparison = np.hstack([raw_bgr, filtered_bgr])
+        cv2.line(comparison, (width, 0), (width, height - 1), (180, 180, 180), 1)
 
         writer.write(comparison)
         frames_written += 1
@@ -395,6 +537,46 @@ def main():
         default=None,
         help="Output video path. Default: phase_filter_compare.mp4 next to input.",
     )
+    ap.add_argument(
+        "--motion-radius-px",
+        type=int,
+        default=6,
+        help="Spatial radius in pixels for local motion support search.",
+    )
+    ap.add_argument(
+        "--motion-window-ms",
+        type=float,
+        default=12.0,
+        help="Temporal window in milliseconds for local motion support search.",
+    )
+    ap.add_argument(
+        "--motion-min-neighbors",
+        type=int,
+        default=2,
+        help="Minimum number of local neighbors required to estimate motion.",
+    )
+    ap.add_argument(
+        "--motion-min-coherence",
+        type=float,
+        default=0.45,
+        help="Minimum local line anisotropy required to keep an event.",
+    )
+    ap.add_argument(
+        "--motion-max-speed-px-per-ms",
+        type=float,
+        default=50.0,
+        help="Reject impossible local velocities above this speed.",
+    )
+    ap.add_argument(
+        "--motion-support-only",
+        action="store_true",
+        help="Keep events with enough local support, skipping PCA anisotropy test.",
+    )
+    ap.add_argument(
+        "--motion-debug-save",
+        default=None,
+        help="Optional path to save debug image showing kept/rejected events.",
+    )
     args = ap.parse_args()
 
     # Resolve input path
@@ -425,40 +607,83 @@ def main():
         print("[WARN] No events in selected analysis interval.")
         return
 
+    # Ensure temporal order for filtering and frame slicing.
+    order = np.argsort(points[:, 2], kind="stable")
+    points = points[order]
+
     print(f"[INFO] Events in analysis interval: {len(points)}")
 
     # Re-normalize timestamps to first event
     if len(points) > 0:
         t_min = points[0, 2]
         points_copy = points.copy()
-        points_copy[:, 2] = points_copy[:, 2] - t_min + points[0, 2]
+        points_copy[:, 2] = points_copy[:, 2] - t_min
         points = points_copy
 
-    # Determine phase frequency
     if args.phase_freq is not None:
-        phase_freq_hz = args.phase_freq
-        print(f"[INFO] Using provided phase frequency: {phase_freq_hz:.2f} Hz")
-    else:
-        phase_freq_hz = estimate_global_fft_peak(
-            points, args.bin_ms, args.max_freq
-        )
-        print(f"[INFO] Estimated phase frequency from FFT: {phase_freq_hz:.2f} Hz")
+        print("[INFO] --phase-freq is ignored by local motion filter mode.")
 
-    # Apply phase filtering
-    print("[INFO] Applying tile-wise phase filtering...")
-    filtered_points, num_rejected, num_kept = tilewise_phase_filter(
+    # Apply local motion filtering
+    print("[INFO] Applying local motion filter...")
+    filtered_points, keep_mask, neighbor_counts = local_motion_filter(
         points,
-        phase_freq_hz,
-        args.tile_size,
-        args.tile_min_events,
         width=W,
         height=H,
+        radius_px=args.motion_radius_px,
+        window_ms=args.motion_window_ms,
+        min_neighbors=args.motion_min_neighbors,
+        min_coherence=args.motion_min_coherence,
+        max_speed_px_per_ms=args.motion_max_speed_px_per_ms,
+        support_only=args.motion_support_only,
     )
+    num_kept = int(keep_mask.sum())
+    num_rejected = int(len(points) - num_kept)
 
-    print(f"[INFO] Phase filtering results:")
-    print(f"  Total events: {len(points)}")
-    print(f"  Rejected: {num_rejected}")
-    print(f"  Kept: {num_kept}")
+    print("[INFO] Local motion filter parameters:")
+    print(f"  radius_px: {args.motion_radius_px}")
+    print(f"  window_ms: {args.motion_window_ms:.3f}")
+    print(f"  min_neighbors: {args.motion_min_neighbors}")
+    print(f"  min_coherence: {args.motion_min_coherence:.3f}")
+    print(f"  max_speed_px_per_ms: {args.motion_max_speed_px_per_ms:.3f}")
+    print(f"  support_only: {args.motion_support_only}")
+
+    print("[INFO] Motion filtering results:")
+    print(f"  Raw event count: {len(points)}")
+    print(f"  Kept event count: {num_kept}")
+    print(f"  Rejected event count: {num_rejected}")
+    kept_pct = (100.0 * num_kept / len(points)) if len(points) > 0 else 0.0
+    print(f"  Kept percentage: {kept_pct:.2f}%")
+    if len(neighbor_counts) > 0:
+        print(f"  Mean valid neighbors/event: {float(np.mean(neighbor_counts)):.2f}")
+        print(f"  Median valid neighbors/event: {float(np.median(neighbor_counts)):.2f}")
+
+    if args.motion_debug_save is not None:
+        try:
+            import cv2
+        except ImportError:
+            raise ImportError(
+                "opencv-python is required for --motion-debug-save. "
+                "Install with: pip install opencv-python"
+            )
+
+        debug_img = np.zeros((H, W, 3), dtype=np.uint8)
+        rejected_points = points[~keep_mask]
+
+        if len(rejected_points) > 0:
+            rx = np.clip(rejected_points[:, 0].astype(np.int64), 0, W - 1)
+            ry = np.clip(rejected_points[:, 1].astype(np.int64), 0, H - 1)
+            debug_img[ry, rx] = (0, 0, 255)
+
+        if len(filtered_points) > 0:
+            kx = np.clip(filtered_points[:, 0].astype(np.int64), 0, W - 1)
+            ky = np.clip(filtered_points[:, 1].astype(np.int64), 0, H - 1)
+            debug_img[ky, kx] = (255, 255, 255)
+
+        debug_path = Path(args.motion_debug_save)
+        debug_ok = cv2.imwrite(str(debug_path), debug_img)
+        if not debug_ok:
+            raise RuntimeError(f"Failed to save motion debug image to {debug_path}")
+        print(f"[INFO] Saved motion debug image: {debug_path}")
 
     # Determine output path
     if args.save is None:
@@ -468,7 +693,12 @@ def main():
 
     print(f"[INFO] Generating comparison video to {output_path}...")
     frames_written = write_comparison_movie(
-        points, filtered_points, output_path, FPS, W, H
+        points,
+        filtered_points,
+        output_path,
+        FPS,
+        W,
+        H,
     )
 
     print(f"[INFO] Video complete: {frames_written} frames written.")

@@ -20,6 +20,8 @@ class OpenMVEventCamNode(Node):
     HEADER_FMT = "<LL"   # event_count, payload_len
     HEADER_SIZE = 4 + struct.calcsize(HEADER_FMT)
 
+    print_log = False
+
     W = 320
     H = 320
 
@@ -245,16 +247,17 @@ class OpenMVEventCamNode(Node):
                     payload_MBps = self.total_payload_bytes / elapsed / 1e6 if elapsed > 0 else 0.0
                     protocol_MBps = self.total_protocol_bytes / elapsed / 1e6 if elapsed > 0 else 0.0
 
-                    self.get_logger().info(
-                        "EVENT STREAM STATS | "
-                        f"packets={self.total_packets}, "
-                        f"events={self.total_events}, "
-                        f"elapsed={elapsed:.2f}s, "
-                        f"packets/s={packets_per_s:.1f}, "
-                        f"events/s={events_per_s:.1f}, "
-                        f"payload_MBps={payload_MBps:.3f}, "
-                        f"protocol_MBps={protocol_MBps:.3f}"
-                    )
+                    if self.print_log:
+                        self.get_logger().info(
+                            "EVENT STREAM STATS | "
+                            f"packets={self.total_packets}, "
+                            f"events={self.total_events}, "
+                            f"elapsed={elapsed:.2f}s, "
+                            f"packets/s={packets_per_s:.1f}, "
+                            f"events/s={events_per_s:.1f}, "
+                            f"payload_MBps={payload_MBps:.3f}, "
+                            f"protocol_MBps={protocol_MBps:.3f}"
+                        )
                     self.last_stats_print = now
 
             except RuntimeError as e:

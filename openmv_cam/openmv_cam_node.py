@@ -17,7 +17,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 
-
 class OpenMVEventCamNode(Node):
     MAGIC = b"EVT1"
     HEADER_FMT = "<LL"   # event_count, payload_len
@@ -25,6 +24,7 @@ class OpenMVEventCamNode(Node):
 
     print_log = False
 
+    # Cam img dims
     W = 320
     H = 320
 

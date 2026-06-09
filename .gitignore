@@ -1,0 +1,5 @@
+openmv_cam/tuning_out/*
+*.tsv
+*.png
+*.mp4
+*.pyc

@@ -52,7 +52,7 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("max_event_frame_packets", 200)
         self.declare_parameter("contrast", 4.0)
         self.declare_parameter("step", 1.0)
-        self.declare_parameter("blur_kernel", 2)
+        self.declare_parameter("blur_kernel", 0)
         self.declare_parameter("sort_by_timestamp", False)
 
         # Raw event recording params
@@ -361,6 +361,8 @@ class OpenMVEventCamNode(Node):
         packet_mono_t_ns: int,
     ):
         event_count = int(events.shape[0])
+        if event_count >= 8192:
+            print("WARNING: event buffer saturated")
         event_t_us = self.event_timestamps_us(events) if event_count > 0 else None
 
         if event_count > 0:
@@ -633,6 +635,10 @@ class OpenMVEventCamNode(Node):
         acc = np.zeros((height, width), dtype=np.float32)
         np.add.at(acc, (ys[pos], xs[pos]), +step)
         np.add.at(acc, (ys[neg], xs[neg]), -step)
+
+        # m = np.percentile(np.abs(acc), 99.0)
+        # m = max(m, 1.0)
+        # acc = np.clip(acc / m, -1.0, 1.0)
 
         m = np.max(np.abs(acc))
         if m > 0:

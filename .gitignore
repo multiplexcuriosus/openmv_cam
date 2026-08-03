@@ -3,3 +3,5 @@ openmv_cam/tuning_out/*
 *.png
 *.mp4
 *.pyc
+*.pdf
+*.npz

@@ -17,6 +17,13 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 
+from .event_frame_contract import (
+    build_event_frame_3ch,
+    render_event_frame_from_arrays,
+    retention_history_ms,
+    validate_event_contract_config,
+)
+
 class OpenMVEventCamNode(Node):
     MAGIC = b"EVT1"
     HEADER_FMT = "<LL"   # event_count, payload_len
@@ -42,7 +49,10 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("event_frame_ch1_ms", 250.0)
         self.declare_parameter("event_frame_ch2_ms", 1000.0)
         self.declare_parameter("event_frame_mode", "cumulative")
-        self.declare_parameter("event_frame_encoding", "bgr8")
+        self.declare_parameter("event_scaling", "signed_log1p_fixed_clip")
+        self.declare_parameter("event_clip_count", 16.0)
+        self.declare_parameter("event_packet_margin_ms", 50.0)
+        self.declare_parameter("event_frame_encoding", "8UC3")
         self.declare_parameter("frame_id", "openmv_cam")
         self.declare_parameter("publish_fps", 30.0)
 
@@ -74,7 +84,10 @@ class OpenMVEventCamNode(Node):
             self.get_parameter("event_frame_ch2_ms").get_parameter_value().double_value,
         ]
         self.event_frame_mode = self.get_parameter("event_frame_mode").get_parameter_value().string_value.strip().lower()
-        self.event_frame_encoding = self.get_parameter("event_frame_encoding").get_parameter_value().string_value.strip().lower()
+        self.event_scaling = self.get_parameter("event_scaling").get_parameter_value().string_value.strip().lower()
+        self.event_clip_count = self.get_parameter("event_clip_count").get_parameter_value().double_value
+        self.event_packet_margin_ms = self.get_parameter("event_packet_margin_ms").get_parameter_value().double_value
+        self.event_frame_encoding = self.get_parameter("event_frame_encoding").get_parameter_value().string_value.strip()
         self.frame_id = self.get_parameter("frame_id").get_parameter_value().string_value
         self.publish_fps = self.get_parameter("publish_fps").get_parameter_value().double_value
 
@@ -91,23 +104,24 @@ class OpenMVEventCamNode(Node):
             self.get_logger().error(error_msg)
             raise ValueError(error_msg)
 
-        if any(window_ms <= 0.0 for window_ms in self.event_frame_windows_ms):
-            raise ValueError("event_frame_ch0_ms, event_frame_ch1_ms, and event_frame_ch2_ms must be positive")
+        contract = validate_event_contract_config(
+            windows_ms=self.event_frame_windows_ms,
+            mode=self.event_frame_mode,
+            event_scaling=self.event_scaling,
+            event_clip_count=self.event_clip_count,
+            packet_margin_ms=self.event_packet_margin_ms,
+        )
+        self.event_frame_windows_ms = list(contract.windows_ms)
+        self.event_frame_mode = contract.mode
+        self.event_scaling = contract.scaling
+        self.event_clip_count = contract.clip_count
+        self.event_packet_margin_ms = contract.packet_margin_ms
 
-        if self.event_frame_mode not in ("cumulative", "shifted"):
-            self.get_logger().warn(
-                f"Invalid event_frame_mode '{self.event_frame_mode}', falling back to 'cumulative'."
+        if self.event_frame_encoding not in ("8UC3", "bgr8", "rgb8"):
+            raise ValueError(
+                "event_frame_encoding must be one of '8UC3', 'bgr8', or 'rgb8', "
+                f"got {self.event_frame_encoding!r}"
             )
-            self.event_frame_mode = "cumulative"
-
-        if self.event_frame_encoding not in ("bgr8", "rgb8"):
-            self.get_logger().warn(
-                f"Invalid event_frame_encoding '{self.event_frame_encoding}', falling back to 'bgr8'."
-            )
-            self.event_frame_encoding = "bgr8"
-
-        if self.event_frame_mode == "shifted":
-            self.event_frame_windows_ms = sorted(self.event_frame_windows_ms)
 
         self.raw_event_output_path = self.get_parameter("raw_event_output_path").get_parameter_value().string_value
         self.flush_every_packets = self.get_parameter("flush_every_packets").get_parameter_value().integer_value
@@ -133,7 +147,7 @@ class OpenMVEventCamNode(Node):
         self._preview_lock = threading.Lock()
         self._h5_lock = threading.Lock()
 
-        # stores tuples: (host_arrival_time_monotonic, events_ndarray)
+        # stores tuples: (host_arrival_time_monotonic, packet_ros_time_ns, events_ndarray)
         self.preview_buffer = deque()
 
         self._recording_enabled = False
@@ -194,8 +208,14 @@ class OpenMVEventCamNode(Node):
             f"encoding={self.event_frame_encoding} enabled={self.publish_3_channel_img}"
         )
         self.get_logger().info(
-            "3-channel windows/mode: "
-            f"windows_ms={self.event_frame_windows_ms}, mode={self.event_frame_mode}"
+            "Live event contract: "
+            f"windows_ms={self.event_frame_windows_ms}, "
+            f"mode={self.event_frame_mode}, "
+            f"scaling={self.event_scaling}, "
+            f"event_clip_count={self.event_clip_count}, "
+            f"packet_margin_ms={self.event_packet_margin_ms}, "
+            f"encoding={self.event_frame_encoding}, "
+            "channel_order=recent_to_oldest"
         )
         self.get_logger().info("Raw event recording initially disabled")
         self.get_logger().info(
@@ -466,10 +486,13 @@ class OpenMVEventCamNode(Node):
             self.preview_buffer.clear()
 
     def _buffer_history_limit_s(self) -> float:
-        history_ms = self.window_ms
-        if self.publish_3_channel_img:
-            history_ms = max(history_ms, max(self.event_frame_windows_ms))
-        return history_ms / 1000.0
+        history_ms = retention_history_ms(
+            mono_window_ms=self.window_ms,
+            max_event_window_ms=max(self.event_frame_windows_ms),
+            event_packet_margin_ms=self.event_packet_margin_ms,
+            include_event_channels=self.publish_3_channel_img,
+        )
+        return float(history_ms) / 1000.0
 
     def _handle_start_event_frame_publishing(self, request, response):
         del request
@@ -656,10 +679,13 @@ class OpenMVEventCamNode(Node):
         contrast: float = 4.0,
         step: float = 1.0,
     ) -> np.ndarray:
-        return OpenMVEventCamNode._render_event_frame_from_events(
-            events,
-            width,
-            height,
+        return render_event_frame_from_arrays(
+            event_type=events[:, 0],
+            event_x=events[:, 4],
+            event_y=events[:, 5],
+            width=width,
+            height=height,
+            scaling_mode="legacy_per_frame_max",
             contrast=contrast,
             step=step,
         )
@@ -673,54 +699,25 @@ class OpenMVEventCamNode(Node):
         height: int,
         windows_ms,
         mode: str,
+        event_scaling: str,
+        event_clip_count: float,
         contrast: float,
         step: float,
     ) -> np.ndarray:
-        if events.size == 0 or event_ts_us.size == 0:
-            return np.full((height, width, 3), 128, dtype=np.uint8)
-
-        windows_ms = [float(window_ms) for window_ms in windows_ms]
-        windows_us = [int(window_ms * 1000.0) for window_ms in windows_ms]
-        mode = (mode or "cumulative").strip().lower()
-
-        if mode == "shifted":
-            starts = [
-                now_event_t_us - windows_us[0],
-                now_event_t_us - windows_us[1],
-                now_event_t_us - windows_us[2],
-            ]
-            ends = [
-                now_event_t_us,
-                now_event_t_us - windows_us[0],
-                now_event_t_us - windows_us[1],
-            ]
-        else:
-            starts = [now_event_t_us - window_us for window_us in windows_us]
-            ends = [now_event_t_us, now_event_t_us, now_event_t_us]
-
-        channel_frames = []
-        for start_us, end_us in zip(starts, ends):
-            if end_us < start_us:
-                channel_frames.append(np.full((height, width), 128, dtype=np.uint8))
-                continue
-            mask = (event_ts_us >= start_us) & (event_ts_us <= end_us)
-            if not np.any(mask):
-                channel_frames.append(np.full((height, width), 128, dtype=np.uint8))
-                continue
-            channel_frames.append(
-                OpenMVEventCamNode._render_event_frame_from_events(
-                    events[mask],
-                    width,
-                    height,
-                    contrast=contrast,
-                    step=step,
-                )
-            )
-
-        if len(channel_frames) != 3:
-            channel_frames = [np.full((height, width), 128, dtype=np.uint8) for _ in range(3)]
-
-        return np.stack(channel_frames[:3], axis=-1)
+        frame_3ch, _counts = build_event_frame_3ch(
+            events=events,
+            event_ts_us=event_ts_us,
+            now_event_t_us=now_event_t_us,
+            width=width,
+            height=height,
+            windows_ms=windows_ms,
+            mode=mode,
+            scaling_mode=event_scaling,
+            event_clip_count=event_clip_count,
+            contrast=contrast,
+            step=step,
+        )
+        return frame_3ch
 
     def _trim_preview_buffer_locked(self, now: float):
         cutoff = now - self._buffer_history_limit_s()
@@ -818,7 +815,7 @@ class OpenMVEventCamNode(Node):
 
                 if self._publishing_enabled:
                     with self._preview_lock:
-                        self.preview_buffer.append((now, events))
+                        self.preview_buffer.append((now, packet_ros_t_ns, events))
                         self._trim_preview_buffer_locked(now)
 
                 if now - self.last_stats_print >= 2.0:
@@ -858,77 +855,85 @@ class OpenMVEventCamNode(Node):
         with self._preview_lock:
             now = time.monotonic()
             self._trim_preview_buffer_locked(now)
+            snapshot = list(self.preview_buffer)
 
-            if not self.preview_buffer:
+        if not snapshot:
+            frame = np.full((self.H, self.W), 128, dtype=np.uint8)
+            frame_3ch = None
+        else:
+            # preview_buffer keeps enough history for all outputs (mono + 3-channel).
+            chunks = [ev for (_, _, ev) in snapshot]
+            chunk = np.concatenate(chunks, axis=0)
+
+            if self.sort_by_timestamp:
+                chunk = self.sort_events_by_timestamp_fn(chunk)
+
+            # Compute event timestamps once from the shared chunk.
+            event_ts_us = self.event_timestamps_us(chunk)
+
+            if event_ts_us.size == 0:
                 frame = np.full((self.H, self.W), 128, dtype=np.uint8)
-                frame_3ch = None
+                frame_3ch = (
+                    np.full((self.H, self.W, 3), 128, dtype=np.uint8)
+                    if self.publish_3_channel_img
+                    else None
+                )
             else:
-                # preview_buffer keeps enough history for all outputs (mono + 3-channel).
-                chunks = [ev for (_, ev) in self.preview_buffer]
-                chunk = np.concatenate(chunks, axis=0)
+                now_event_t_us = int(np.max(event_ts_us))
 
-                if self.sort_by_timestamp:
-                    chunk = self.sort_events_by_timestamp_fn(chunk)
+                # Mono output is explicitly filtered to window_ms.
+                mono_window_us = int(self.window_ms * 1000.0)
+                mono_mask = event_ts_us >= (now_event_t_us - mono_window_us)
+                mono_chunk = chunk[mono_mask]
 
-                # Compute event timestamps once from the shared chunk.
-                event_ts_us = self.event_timestamps_us(chunk)
-
-                if event_ts_us.size == 0:
+                if mono_chunk.size == 0:
                     frame = np.full((self.H, self.W), 128, dtype=np.uint8)
-                    frame_3ch = np.full((self.H, self.W, 3), 128, dtype=np.uint8) if self.publish_3_channel_img else None
                 else:
-                    now_event_t_us = int(np.max(event_ts_us))
+                    frame = self.events_to_preview_frame(
+                        mono_chunk,
+                        self.W,
+                        self.H,
+                        contrast=self.contrast,
+                        step=self.step,
+                    )
 
-                    # Mono output is explicitly filtered to window_ms.
-                    mono_window_us = int(self.window_ms * 1000.0)
-                    mono_mask = event_ts_us >= (now_event_t_us - mono_window_us)
-                    mono_chunk = chunk[mono_mask]
+                frame_3ch = None
+                if self.publish_3_channel_img:
+                    # 3-channel output uses full retained chunk with its own configured windows.
+                    frame_3ch = self.events_to_shifted_3ch_frame(
+                        chunk,
+                        event_ts_us,
+                        now_event_t_us,
+                        self.W,
+                        self.H,
+                        self.event_frame_windows_ms,
+                        self.event_frame_mode,
+                        self.event_scaling,
+                        float(self.event_clip_count) if self.event_clip_count is not None else 0.0,
+                        self.contrast,
+                        self.step,
+                    )
 
-                    if mono_chunk.size == 0:
-                        frame = np.full((self.H, self.W), 128, dtype=np.uint8)
-                    else:
-                        frame = self.events_to_preview_frame(
-                            mono_chunk,
-                            self.W,
-                            self.H,
-                            contrast=self.contrast,
-                            step=self.step,
+                if self.print_log and (now - self._last_publish_debug_log_t) >= 3.0:
+                    mono_count = int(np.count_nonzero(mono_mask))
+                    full_count = int(chunk.shape[0])
+                    self.get_logger().info(
+                        "PUBLISH DEBUG | "
+                        f"mono_selected_events={mono_count}, "
+                        f"full_buffered_events={full_count}, "
+                        f"mono_window_ms={self.window_ms:.1f}, "
+                        f"event_frame_windows_ms={self.event_frame_windows_ms}, "
+                        f"event_scaling={self.event_scaling}"
+                    )
+                    self._last_publish_debug_log_t = now
+
+            if self.publish_3_channel_img and frame_3ch is not None:
+                if self.blur_kernel and self.blur_kernel > 1 and self.event_scaling == "legacy_per_frame_max":
+                    for ch_idx in range(frame_3ch.shape[2]):
+                        frame_3ch[:, :, ch_idx] = cv2.blur(
+                            frame_3ch[:, :, ch_idx],
+                            (self.blur_kernel, self.blur_kernel),
                         )
-
-                    frame_3ch = None
-                    if self.publish_3_channel_img:
-                        # 3-channel output uses full retained chunk with its own configured windows.
-                        frame_3ch = self.events_to_shifted_3ch_frame(
-                            chunk,
-                            event_ts_us,
-                            now_event_t_us,
-                            self.W,
-                            self.H,
-                            self.event_frame_windows_ms,
-                            self.event_frame_mode,
-                            self.contrast,
-                            self.step,
-                        )
-
-                    if self.print_log and (now - self._last_publish_debug_log_t) >= 3.0:
-                        mono_count = int(np.count_nonzero(mono_mask))
-                        full_count = int(chunk.shape[0])
-                        self.get_logger().info(
-                            "PUBLISH DEBUG | "
-                            f"mono_selected_events={mono_count}, "
-                            f"full_buffered_events={full_count}, "
-                            f"mono_window_ms={self.window_ms:.1f}, "
-                            f"event_frame_windows_ms={self.event_frame_windows_ms}"
-                        )
-                        self._last_publish_debug_log_t = now
-
-                if self.publish_3_channel_img and frame_3ch is not None:
-                    if self.blur_kernel and self.blur_kernel > 1:
-                        for ch_idx in range(frame_3ch.shape[2]):
-                            frame_3ch[:, :, ch_idx] = cv2.blur(
-                                frame_3ch[:, :, ch_idx],
-                                (self.blur_kernel, self.blur_kernel),
-                            )
 
         if self.blur_kernel and self.blur_kernel > 1:
             frame = cv2.blur(frame, (self.blur_kernel, self.blur_kernel))

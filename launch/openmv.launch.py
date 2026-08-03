@@ -15,19 +15,31 @@ def generate_launch_description():
 
     event_frame_mode_arg = DeclareLaunchArgument(
         "event_frame_mode",
-        default_value=str(OPENMV_PARAMS.get("event_frame_mode", "cumulative")),
+        default_value="shifted",
     )
     event_frame_ch0_ms_arg = DeclareLaunchArgument(
         "event_frame_ch0_ms",
-        default_value=str(OPENMV_PARAMS.get("event_frame_ch0_ms", 50.0)),
+        default_value="50.0",
     )
     event_frame_ch1_ms_arg = DeclareLaunchArgument(
         "event_frame_ch1_ms",
-        default_value=str(OPENMV_PARAMS.get("event_frame_ch1_ms", 250.0)),
+        default_value="100.0",
     )
     event_frame_ch2_ms_arg = DeclareLaunchArgument(
         "event_frame_ch2_ms",
-        default_value=str(OPENMV_PARAMS.get("event_frame_ch2_ms", 1000.0)),
+        default_value="200.0",
+    )
+    event_scaling_arg = DeclareLaunchArgument(
+        "event_scaling",
+        default_value="signed_log1p_fixed_clip",
+    )
+    event_clip_count_arg = DeclareLaunchArgument(
+        "event_clip_count",
+        default_value="16.0",
+    )
+    event_packet_margin_ms_arg = DeclareLaunchArgument(
+        "event_packet_margin_ms",
+        default_value="50.0",
     )
 
     openmv_params = dict(OPENMV_PARAMS)
@@ -36,6 +48,9 @@ def generate_launch_description():
         "event_frame_ch0_ms": LaunchConfiguration("event_frame_ch0_ms"),
         "event_frame_ch1_ms": LaunchConfiguration("event_frame_ch1_ms"),
         "event_frame_ch2_ms": LaunchConfiguration("event_frame_ch2_ms"),
+        "event_scaling": LaunchConfiguration("event_scaling"),
+        "event_clip_count": LaunchConfiguration("event_clip_count"),
+        "event_packet_margin_ms": LaunchConfiguration("event_packet_margin_ms"),
     })
 
     openmv_node = Node(
@@ -51,6 +66,9 @@ def generate_launch_description():
         event_frame_ch0_ms_arg,
         event_frame_ch1_ms_arg,
         event_frame_ch2_ms_arg,
+        event_scaling_arg,
+        event_clip_count_arg,
+        event_packet_margin_ms_arg,
         openmv_node,
     ])
 

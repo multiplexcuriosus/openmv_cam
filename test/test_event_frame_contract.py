@@ -6,6 +6,7 @@ import numpy as np
 from openmv_cam.event_frame_contract import (
     build_event_frame_3ch,
     build_time_ranges_us,
+    build_xyt_signed_voxel,
     render_event_frame_from_arrays,
     retention_history_ms,
 )
@@ -27,6 +28,107 @@ def _single_pixel_event(tp: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         np.asarray([0], dtype=np.int16),
         np.asarray([0], dtype=np.int16),
     )
+
+
+def _events(types, xs, ys) -> np.ndarray:
+    events = np.zeros((len(types), 6), dtype=np.uint16)
+    events[:, 0] = np.asarray(types, dtype=np.uint16)
+    events[:, 4] = np.asarray(xs, dtype=np.uint16)
+    events[:, 5] = np.asarray(ys, dtype=np.uint16)
+    return events
+
+
+def _build_voxel(events, timestamps, **overrides):
+    options = {
+        "sensor_width": 4,
+        "sensor_height": 4,
+        "output_width": 4,
+        "output_height": 4,
+        "horizon_ms": 0.09,
+        "temporal_bins": 3,
+        "scaling_mode": "signed_log1p_fixed_clip",
+        "event_clip_count": 16.0,
+    }
+    options.update(overrides)
+    return build_xyt_signed_voxel(
+        events,
+        np.asarray(timestamps, dtype=np.int64),
+        1_000,
+        **options,
+    )
+
+
+def test_xyt_temporal_boundaries_are_causal_and_unique():
+    # Edges are 910, 940, 970, 1000 us. Internal edges enter the newer bin.
+    timestamps = [909, 910, 940, 970, 1_000, 1_001]
+    events = _events([1] * len(timestamps), [0] * len(timestamps), [0] * len(timestamps))
+    voxel, counts = _build_voxel(events, timestamps)
+
+    np.testing.assert_array_equal(counts, np.asarray([1, 1, 2], dtype=np.int32))
+    assert sum(counts) == 4
+    assert np.all(voxel[0, 0, :] != 128)
+
+
+def test_xyt_channels_are_oldest_to_newest():
+    events = _events([1, 1, 1], [0, 1, 2], [0, 0, 0])
+    voxel, counts = _build_voxel(events, [920, 950, 980])
+
+    np.testing.assert_array_equal(counts, np.ones((3,), dtype=np.int32))
+    assert voxel[0, 0, 0] != 128
+    assert voxel[0, 0, 1] == 128
+    assert voxel[0, 0, 2] == 128
+    assert voxel[0, 2, 2] != 128
+
+
+def test_xyt_polarities_cancel_before_log_scaling():
+    events = _events([1, 0], [1, 1], [2, 2])
+    voxel, counts = _build_voxel(events, [980, 980])
+
+    assert counts[2] == 2
+    assert voxel[2, 1, 2] == 128
+
+
+def test_xyt_spatial_binning_maps_sensor_edges_and_drops_invalid_coordinates():
+    # uint16 cannot represent negatives, so 4 is used as the invalid upper edge.
+    events = _events([1, 1, 1], [0, 3, 4], [0, 3, 0])
+    voxel, counts = _build_voxel(
+        events,
+        [980, 980, 980],
+        output_width=2,
+        output_height=2,
+    )
+
+    assert counts[2] == 2
+    assert voxel[0, 0, 2] != 128
+    assert voxel[1, 1, 2] != 128
+
+
+def test_xyt_empty_volume_and_fixed_log_clipping():
+    empty, counts = _build_voxel(np.zeros((0, 6), dtype=np.uint16), [])
+    assert empty.shape == (4, 4, 3)
+    assert np.all(empty == 128)
+    assert not np.any(counts)
+
+    events = _events([1] * 20 + [0] * 20, [0] * 20 + [1] * 20, [0] * 40)
+    clipped, _ = _build_voxel(events, [980] * 40)
+    assert clipped[0, 0, 2] == 255
+    assert clipped[0, 1, 2] == 1
+
+
+def test_xyt_shape_dtype_and_contiguity_are_generic():
+    events = _events([1], [3], [3])
+    voxel, counts = _build_voxel(
+        events,
+        [1_000],
+        output_width=3,
+        output_height=2,
+        temporal_bins=9,
+    )
+
+    assert voxel.shape == (2, 3, 9)
+    assert voxel.dtype == np.uint8
+    assert voxel.flags.c_contiguous
+    assert counts.shape == (9,)
 
 
 def test_fixed_log_positive_and_negative_values_exact():
@@ -176,6 +278,16 @@ def test_packet_margin_changes_retention_not_bin_widths():
     keep_with_margin = retention_history_ms(100.0, 200.0, 50.0, include_event_channels=True)
     assert keep_no_margin == 200.0
     assert keep_with_margin == 250.0
+
+    keep_with_voxel = retention_history_ms(
+        100.0,
+        200.0,
+        50.0,
+        include_event_channels=False,
+        event_voxel_horizon_ms=300.0,
+        include_event_voxel=True,
+    )
+    assert keep_with_voxel == 350.0
 
     # Bin geometry is independent of packet margin.
     ranges = build_time_ranges_us(1_000_000, (50.0, 100.0, 200.0), "shifted")

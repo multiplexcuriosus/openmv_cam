@@ -106,11 +106,162 @@ def retention_history_ms(
     max_event_window_ms: float,
     event_packet_margin_ms: float,
     include_event_channels: bool,
+    event_voxel_horizon_ms: float = 0.0,
+    include_event_voxel: bool = False,
 ) -> float:
     mono_ms = float(mono_window_ms)
-    if not include_event_channels:
-        return mono_ms
-    return max(mono_ms, float(max_event_window_ms) + float(event_packet_margin_ms))
+    histories_ms = [mono_ms]
+    if include_event_channels:
+        histories_ms.append(
+            float(max_event_window_ms) + float(event_packet_margin_ms)
+        )
+    if include_event_voxel:
+        histories_ms.append(
+            float(event_voxel_horizon_ms) + float(event_packet_margin_ms)
+        )
+    return max(histories_ms)
+
+
+def validate_xyt_voxel_config(
+    *,
+    sensor_width: int,
+    sensor_height: int,
+    output_width: int,
+    output_height: int,
+    horizon_ms: float,
+    temporal_bins: int,
+    scaling_mode: str,
+    event_clip_count: Optional[float],
+) -> Tuple[int, int, int, int, float, int, str, float]:
+    dimensions = (
+        int(sensor_width),
+        int(sensor_height),
+        int(output_width),
+        int(output_height),
+    )
+    if any(dimension <= 0 for dimension in dimensions):
+        raise ValueError(
+            "sensor and output dimensions must be positive, got "
+            f"sensor=({sensor_width}, {sensor_height}), "
+            f"output=({output_width}, {output_height})"
+        )
+
+    horizon = float(horizon_ms)
+    if not np.isfinite(horizon) or horizon <= 0.0:
+        raise ValueError(f"horizon_ms must be positive and finite, got {horizon_ms}")
+
+    bins = int(temporal_bins)
+    if bins <= 0 or bins != temporal_bins:
+        raise ValueError(f"temporal_bins must be a positive integer, got {temporal_bins}")
+
+    scaling, clip_count = validate_event_scaling(scaling_mode, event_clip_count)
+    if scaling != "signed_log1p_fixed_clip":
+        raise ValueError(
+            "XYT voxel scaling must be 'signed_log1p_fixed_clip', "
+            f"got {scaling_mode!r}"
+        )
+    assert clip_count is not None
+    return (*dimensions, horizon, bins, scaling, clip_count)
+
+
+def build_xyt_signed_voxel(
+    events: np.ndarray,
+    event_ts_us: np.ndarray,
+    anchor_t_us: int,
+    *,
+    sensor_width: int,
+    sensor_height: int,
+    output_width: int,
+    output_height: int,
+    horizon_ms: float,
+    temporal_bins: int,
+    scaling_mode: str,
+    event_clip_count: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build a causal signed XYT volume in oldest-to-newest HWC order."""
+    (
+        sensor_width,
+        sensor_height,
+        output_width,
+        output_height,
+        horizon_ms,
+        temporal_bins,
+        _scaling,
+        clip_count,
+    ) = validate_xyt_voxel_config(
+        sensor_width=sensor_width,
+        sensor_height=sensor_height,
+        output_width=output_width,
+        output_height=output_height,
+        horizon_ms=horizon_ms,
+        temporal_bins=temporal_bins,
+        scaling_mode=scaling_mode,
+        event_clip_count=event_clip_count,
+    )
+
+    shape = (output_height, output_width, temporal_bins)
+    empty = np.full(shape, 128, dtype=np.uint8)
+    counts = np.zeros((temporal_bins,), dtype=np.int32)
+    if events.size == 0 or event_ts_us.size == 0:
+        return empty, counts
+
+    events_array = np.asarray(events)
+    timestamps = np.asarray(event_ts_us, dtype=np.int64)
+    if events_array.ndim != 2 or events_array.shape[1] < 6:
+        raise ValueError(f"events must have shape (N, >=6), got {events_array.shape}")
+    if timestamps.ndim != 1 or timestamps.shape[0] != events_array.shape[0]:
+        raise ValueError(
+            "event_ts_us must be one-dimensional and match the event count, "
+            f"got events={events_array.shape[0]}, timestamps={timestamps.shape}"
+        )
+
+    horizon_us = int(round(horizon_ms * 1_000.0))
+    if horizon_us <= 0:
+        raise ValueError(f"horizon_ms is below timestamp resolution, got {horizon_ms}")
+    anchor = int(anchor_t_us)
+    start = anchor - horizon_us
+
+    xs = events_array[:, 4].astype(np.int64, copy=False)
+    ys = events_array[:, 5].astype(np.int64, copy=False)
+    valid = (
+        (timestamps >= start)
+        & (timestamps <= anchor)
+        & (xs >= 0)
+        & (xs < sensor_width)
+        & (ys >= 0)
+        & (ys < sensor_height)
+    )
+    if not np.any(valid):
+        return empty, counts
+
+    selected_ts = timestamps[valid]
+    selected_x = xs[valid]
+    selected_y = ys[valid]
+    selected_type = events_array[valid, 0]
+
+    temporal_index = ((selected_ts - start) * temporal_bins) // horizon_us
+    temporal_index = np.minimum(temporal_index, temporal_bins - 1)
+    output_x = (selected_x * output_width) // sensor_width
+    output_y = (selected_y * output_height) // sensor_height
+
+    counts = np.bincount(
+        temporal_index, minlength=temporal_bins
+    ).astype(np.int32, copy=False)
+    flat_index = (
+        (output_y * output_width + output_x) * temporal_bins + temporal_index
+    )
+    polarity = np.where(selected_type == 1, 1, -1).astype(np.int32)
+    accumulation = np.zeros(shape, dtype=np.int32)
+    np.add.at(accumulation.ravel(), flat_index, polarity)
+
+    normalized = (
+        np.sign(accumulation)
+        * np.log1p(np.abs(accumulation))
+        / np.log1p(float(clip_count))
+    )
+    normalized = np.clip(normalized, -1.0, 1.0)
+    voxel = np.rint(128.0 + 127.0 * normalized).astype(np.uint8)
+    return np.ascontiguousarray(voxel), counts
 
 
 def build_time_ranges_us(

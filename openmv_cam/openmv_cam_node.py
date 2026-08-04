@@ -23,6 +23,8 @@ from .event_frame_contract import (
     retention_history_ms,
     validate_event_contract_config,
 )
+from .image_rotation import SUPPORTED_ROTATIONS_DEG, rotate_event_frame
+
 
 class OpenMVEventCamNode(Node):
     MAGIC = b"EVT1"
@@ -55,6 +57,7 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("event_frame_encoding", "8UC3")
         self.declare_parameter("frame_id", "openmv_cam")
         self.declare_parameter("publish_fps", 30.0)
+        self.declare_parameter("event_frame_rotation_degrees", 0)
 
         # Preview/render params
         self.declare_parameter("window_ms", 100.0)
@@ -90,6 +93,17 @@ class OpenMVEventCamNode(Node):
         self.event_frame_encoding = self.get_parameter("event_frame_encoding").get_parameter_value().string_value.strip()
         self.frame_id = self.get_parameter("frame_id").get_parameter_value().string_value
         self.publish_fps = self.get_parameter("publish_fps").get_parameter_value().double_value
+        self.event_frame_rotation_degrees = (
+            self.get_parameter("event_frame_rotation_degrees")
+            .get_parameter_value()
+            .integer_value
+        )
+
+        if self.event_frame_rotation_degrees not in SUPPORTED_ROTATIONS_DEG:
+            raise ValueError(
+                "event_frame_rotation_degrees must be one of "
+                f"{SUPPORTED_ROTATIONS_DEG}, got {self.event_frame_rotation_degrees}"
+            )
 
         self.window_ms = self.get_parameter("window_ms").get_parameter_value().double_value
         self.max_preview_packets = self.get_parameter("max_preview_packets").get_parameter_value().integer_value
@@ -189,6 +203,21 @@ class OpenMVEventCamNode(Node):
             "/openmv_cam/stop_event_frame_publishing",
             self._handle_stop_event_frame_publishing,
         )
+        self._rotate_plus_90_srv = self.create_service(
+            Trigger,
+            "/openmv_cam/rotate_event_frame_plus_90",
+            self._make_event_frame_rotation_handler(90),
+        )
+        self._rotate_180_srv = self.create_service(
+            Trigger,
+            "/openmv_cam/rotate_event_frame_180",
+            self._make_event_frame_rotation_handler(180),
+        )
+        self._rotate_minus_90_srv = self.create_service(
+            Trigger,
+            "/openmv_cam/rotate_event_frame_minus_90",
+            self._make_event_frame_rotation_handler(-90),
+        )
         self._start_rec_srv = self.create_service(
             Trigger,
             "/openmv_cam/start_raw_event_recording",
@@ -222,6 +251,9 @@ class OpenMVEventCamNode(Node):
             "Available services: "
             "/openmv_cam/start_event_frame_publishing, "
             "/openmv_cam/stop_event_frame_publishing, "
+            "/openmv_cam/rotate_event_frame_plus_90, "
+            "/openmv_cam/rotate_event_frame_180, "
+            "/openmv_cam/rotate_event_frame_minus_90, "
             "/openmv_cam/start_raw_event_recording, "
             "/openmv_cam/stop_raw_event_recording"
         )
@@ -525,6 +557,20 @@ class OpenMVEventCamNode(Node):
         response.success = True
         response.message = ""
         return response     
+
+    def _make_event_frame_rotation_handler(self, rotation_degrees: int):
+        def handle_rotation(request, response):
+            del request
+            self.event_frame_rotation_degrees = rotation_degrees
+            response.success = True
+            response.message = (
+                f"Event frame output rotation set to {rotation_degrees} degrees "
+                "counterclockwise"
+            )
+            self.get_logger().info(response.message)
+            return response
+
+        return handle_rotation
 
     def _handle_start_raw_event_recording(self, request, response):
         del request
@@ -937,6 +983,12 @@ class OpenMVEventCamNode(Node):
 
         if self.blur_kernel and self.blur_kernel > 1:
             frame = cv2.blur(frame, (self.blur_kernel, self.blur_kernel))
+
+        frame = rotate_event_frame(frame, self.event_frame_rotation_degrees)
+        if frame_3ch is not None:
+            frame_3ch = rotate_event_frame(
+                frame_3ch, self.event_frame_rotation_degrees
+            )
 
         self._publish_mono_image(frame)
         if self.publish_3_channel_img:

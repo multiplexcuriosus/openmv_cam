@@ -36,6 +36,19 @@ def test_rotation_preserves_trailing_channels():
     np.testing.assert_array_equal(rotated[:, :, 0], np.rot90(image[:, :, 0]))
 
 
+def test_rotation_preserves_hwc9_temporal_channel_order():
+    image = np.arange(2 * 3 * 9, dtype=np.uint8).reshape(2, 3, 9)
+    rotated = rotate_event_frame(image, -90)
+
+    assert rotated.shape == (3, 2, 9)
+    assert rotated.flags.c_contiguous
+    for channel in range(9):
+        np.testing.assert_array_equal(
+            rotated[:, :, channel],
+            np.rot90(image[:, :, channel], k=-1),
+        )
+
+
 def test_unsupported_rotation_is_rejected(image):
     with pytest.raises(ValueError, match="must be one of"):
         rotate_event_frame(image, 45)

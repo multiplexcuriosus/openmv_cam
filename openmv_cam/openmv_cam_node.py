@@ -19,11 +19,43 @@ from std_srvs.srv import Trigger
 
 from .event_frame_contract import (
     build_event_frame_3ch,
+    build_xyt_signed_voxel,
     render_event_frame_from_arrays,
     retention_history_ms,
     validate_event_contract_config,
+    validate_xyt_voxel_config,
 )
 from .image_rotation import SUPPORTED_ROTATIONS_DEG, rotate_event_frame
+
+
+def build_hwc9_image_message(
+    image: np.ndarray,
+    *,
+    encoding: str,
+    stamp,
+    frame_id: str,
+) -> Image:
+    """Serialize a contiguous uint8 HWC9 array without cv_bridge assumptions."""
+    if image.dtype != np.uint8:
+        raise ValueError(f"XYT voxel must have dtype uint8, got {image.dtype}")
+    if image.ndim != 3 or image.shape[2] != 9:
+        raise ValueError(f"XYT voxel must have shape (H, W, 9), got {image.shape}")
+    if not image.flags.c_contiguous:
+        raise ValueError("XYT voxel must be C-contiguous")
+    if encoding != "8UC9":
+        raise ValueError(f"XYT voxel encoding must be '8UC9', got {encoding!r}")
+
+    height, width, channels = image.shape
+    msg = Image()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.height = int(height)
+    msg.width = int(width)
+    msg.encoding = encoding
+    msg.is_bigendian = 0
+    msg.step = int(width * channels)
+    msg.data = image.tobytes(order="C")
+    return msg
 
 
 class OpenMVEventCamNode(Node):
@@ -55,6 +87,17 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("event_clip_count", 16.0)
         self.declare_parameter("event_packet_margin_ms", 50.0)
         self.declare_parameter("event_frame_encoding", "8UC3")
+        self.declare_parameter("publish_xyt_voxel", False)
+        self.declare_parameter("topic_xyt_voxel", "/openmv_cam/event_voxel")
+        self.declare_parameter("event_voxel_horizon_ms", 200.0)
+        self.declare_parameter("event_voxel_temporal_bins", 9)
+        self.declare_parameter("event_voxel_height", 320)
+        self.declare_parameter("event_voxel_width", 320)
+        self.declare_parameter(
+            "event_voxel_scaling", "signed_log1p_fixed_clip"
+        )
+        self.declare_parameter("event_voxel_clip_count", 16.0)
+        self.declare_parameter("event_voxel_encoding", "8UC9")
         self.declare_parameter("frame_id", "openmv_cam")
         self.declare_parameter("publish_fps", 30.0)
         self.declare_parameter("event_frame_rotation_degrees", 0)
@@ -91,6 +134,25 @@ class OpenMVEventCamNode(Node):
         self.event_clip_count = self.get_parameter("event_clip_count").get_parameter_value().double_value
         self.event_packet_margin_ms = self.get_parameter("event_packet_margin_ms").get_parameter_value().double_value
         self.event_frame_encoding = self.get_parameter("event_frame_encoding").get_parameter_value().string_value.strip()
+        self.publish_xyt_voxel = self.get_parameter("publish_xyt_voxel").value
+        self.topic_xyt_voxel = str(self.get_parameter("topic_xyt_voxel").value).strip()
+        self.event_voxel_horizon_ms = float(
+            self.get_parameter("event_voxel_horizon_ms").value
+        )
+        self.event_voxel_temporal_bins = int(
+            self.get_parameter("event_voxel_temporal_bins").value
+        )
+        self.event_voxel_height = int(self.get_parameter("event_voxel_height").value)
+        self.event_voxel_width = int(self.get_parameter("event_voxel_width").value)
+        self.event_voxel_scaling = str(
+            self.get_parameter("event_voxel_scaling").value
+        ).strip().lower()
+        self.event_voxel_clip_count = float(
+            self.get_parameter("event_voxel_clip_count").value
+        )
+        self.event_voxel_encoding = str(
+            self.get_parameter("event_voxel_encoding").value
+        ).strip()
         self.frame_id = self.get_parameter("frame_id").get_parameter_value().string_value
         self.publish_fps = self.get_parameter("publish_fps").get_parameter_value().double_value
         self.event_frame_rotation_degrees = (
@@ -113,8 +175,9 @@ class OpenMVEventCamNode(Node):
         self.blur_kernel = self.get_parameter("blur_kernel").get_parameter_value().integer_value
         self.sort_by_timestamp = self.get_parameter("sort_by_timestamp").get_parameter_value().bool_value
 
-        if self.topic == self.topic_3_channel:
-            error_msg = "Mono event image topic and 3-channel event image topic must be different."
+        configured_topics = [self.topic, self.topic_3_channel, self.topic_xyt_voxel]
+        if len(set(configured_topics)) != len(configured_topics):
+            error_msg = "Mono, 3-channel, and XYT event image topics must be different."
             self.get_logger().error(error_msg)
             raise ValueError(error_msg)
 
@@ -137,6 +200,36 @@ class OpenMVEventCamNode(Node):
                 f"got {self.event_frame_encoding!r}"
             )
 
+        (
+            _sensor_width,
+            _sensor_height,
+            self.event_voxel_width,
+            self.event_voxel_height,
+            self.event_voxel_horizon_ms,
+            self.event_voxel_temporal_bins,
+            self.event_voxel_scaling,
+            self.event_voxel_clip_count,
+        ) = validate_xyt_voxel_config(
+            sensor_width=self.W,
+            sensor_height=self.H,
+            output_width=self.event_voxel_width,
+            output_height=self.event_voxel_height,
+            horizon_ms=self.event_voxel_horizon_ms,
+            temporal_bins=self.event_voxel_temporal_bins,
+            scaling_mode=self.event_voxel_scaling,
+            event_clip_count=self.event_voxel_clip_count,
+        )
+        if self.event_voxel_temporal_bins != 9:
+            raise ValueError(
+                "xyt_signed_voxel_v1 requires event_voxel_temporal_bins=9, "
+                f"got {self.event_voxel_temporal_bins}"
+            )
+        if self.event_voxel_encoding != "8UC9":
+            raise ValueError(
+                "xyt_signed_voxel_v1 requires event_voxel_encoding='8UC9', "
+                f"got {self.event_voxel_encoding!r}"
+            )
+
         self.raw_event_output_path = self.get_parameter("raw_event_output_path").get_parameter_value().string_value
         self.flush_every_packets = self.get_parameter("flush_every_packets").get_parameter_value().integer_value
         self.hdf5_chunk_size = self.get_parameter("hdf5_chunk_size").get_parameter_value().integer_value
@@ -148,6 +241,7 @@ class OpenMVEventCamNode(Node):
         self.bridge = CvBridge()
         self.pub_mono_img = None
         self.pub_3ch = None
+        self.pub_xyt_voxel = None
         self.publish_timer = None
         self._publishing_enabled = False
         self._preview_history_truncated_warned = False
@@ -237,6 +331,10 @@ class OpenMVEventCamNode(Node):
             f"encoding={self.event_frame_encoding} enabled={self.publish_3_channel_img}"
         )
         self.get_logger().info(
+            f"XYT event voxel topic: {self.topic_xyt_voxel} "
+            f"encoding={self.event_voxel_encoding} enabled={self.publish_xyt_voxel}"
+        )
+        self.get_logger().info(
             "Live event contract: "
             f"windows_ms={self.event_frame_windows_ms}, "
             f"mode={self.event_frame_mode}, "
@@ -245,6 +343,15 @@ class OpenMVEventCamNode(Node):
             f"packet_margin_ms={self.event_packet_margin_ms}, "
             f"encoding={self.event_frame_encoding}, "
             "channel_order=recent_to_oldest"
+        )
+        self.get_logger().info(
+            "XYT live contract: "
+            f"horizon_ms={self.event_voxel_horizon_ms}, "
+            f"temporal_bins={self.event_voxel_temporal_bins}, "
+            f"shape=({self.event_voxel_height},{self.event_voxel_width},9), "
+            f"scaling={self.event_voxel_scaling}, "
+            f"clip_count={self.event_voxel_clip_count}, "
+            "channel_order=oldest_to_newest, causal=true"
         )
         self.get_logger().info("Raw event recording initially disabled")
         self.get_logger().info(
@@ -494,6 +601,10 @@ class OpenMVEventCamNode(Node):
             self.pub_mono_img = self.create_publisher(Image, self.topic, 10)
         if self.publish_3_channel_img and self.pub_3ch is None:
             self.pub_3ch = self.create_publisher(Image, self.topic_3_channel, 10)
+        if self.publish_xyt_voxel and self.pub_xyt_voxel is None:
+            self.pub_xyt_voxel = self.create_publisher(
+                Image, self.topic_xyt_voxel, 10
+            )
         if self.publish_timer is None:
             self.publish_timer = self.create_timer(1.0 / self.publish_fps, self._publish_timer_cb)
         if not self._publisher_config_logged:
@@ -501,7 +612,9 @@ class OpenMVEventCamNode(Node):
                 "Publishers configured: "
                 f"mono_topic={self.topic}, "
                 f"topic_3_channel={self.topic_3_channel}, "
-                f"publish_3_channel_img={self.publish_3_channel_img}"
+                f"publish_3_channel_img={self.publish_3_channel_img}, "
+                f"topic_xyt_voxel={self.topic_xyt_voxel}, "
+                f"publish_xyt_voxel={self.publish_xyt_voxel}"
             )
             self._publisher_config_logged = True
 
@@ -523,6 +636,8 @@ class OpenMVEventCamNode(Node):
             max_event_window_ms=max(self.event_frame_windows_ms),
             event_packet_margin_ms=self.event_packet_margin_ms,
             include_event_channels=self.publish_3_channel_img,
+            event_voxel_horizon_ms=self.event_voxel_horizon_ms,
+            include_event_voxel=self.publish_xyt_voxel,
         )
         return float(history_ms) / 1000.0
 
@@ -540,6 +655,10 @@ class OpenMVEventCamNode(Node):
             message += f"; 3-channel topic {self.topic_3_channel} active"
         else:
             message += "; 3-channel publishing disabled"
+        if self.publish_xyt_voxel:
+            message += f"; XYT voxel topic {self.topic_xyt_voxel} active"
+        else:
+            message += "; XYT voxel publishing disabled"
         self.get_logger().info(message)
         response.success = True
         response.message = ""
@@ -553,7 +672,7 @@ class OpenMVEventCamNode(Node):
             return response
 
         self._stop_publishing_internal()
-        self.get_logger().info("Event frame publishing stopped for both mono and 3-channel outputs")
+        self.get_logger().info("Event frame publishing stopped for all configured outputs")
         response.success = True
         response.message = ""
         return response     
@@ -773,7 +892,7 @@ class OpenMVEventCamNode(Node):
 
         safety_cap = (
             max(1, int(self.max_event_frame_packets))
-            if self.publish_3_channel_img
+            if self.publish_3_channel_img or self.publish_xyt_voxel
             else max(1, int(self.max_preview_packets))
         )
         if len(self.preview_buffer) > safety_cap:
@@ -782,8 +901,9 @@ class OpenMVEventCamNode(Node):
                 self.preview_buffer.popleft()
             if not self._preview_history_truncated_warned:
                 self.get_logger().warn(
-                    f"Preview buffer truncated by safety cap ({safety_cap} packets); 3-channel history may be incomplete."
-                    if self.publish_3_channel_img
+                    "Preview buffer truncated by safety cap "
+                    f"({safety_cap} packets); event-volume history may be incomplete."
+                    if self.publish_3_channel_img or self.publish_xyt_voxel
                     else f"Preview buffer truncated by safety cap ({safety_cap} packets)."
                 )
                 self._preview_history_truncated_warned = True
@@ -814,6 +934,23 @@ class OpenMVEventCamNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
         self.pub_3ch.publish(msg)
+
+    def _publish_xyt_image(self, voxel: np.ndarray):
+        if self.pub_xyt_voxel is None:
+            return
+        try:
+            msg = build_hwc9_image_message(
+                voxel,
+                encoding=self.event_voxel_encoding,
+                stamp=self.get_clock().now().to_msg(),
+                frame_id=self.frame_id,
+            )
+        except ValueError as error:
+            self.get_logger().error(
+                f"Refusing to publish XYT voxel on {self.topic_xyt_voxel}: {error}"
+            )
+            return
+        self.pub_xyt_voxel.publish(msg)
 
     def _reader_loop(self):
         while not self._stop_event.is_set():
@@ -906,6 +1043,19 @@ class OpenMVEventCamNode(Node):
         if not snapshot:
             frame = np.full((self.H, self.W), 128, dtype=np.uint8)
             frame_3ch = None
+            voxel = (
+                np.full(
+                    (
+                        self.event_voxel_height,
+                        self.event_voxel_width,
+                        self.event_voxel_temporal_bins,
+                    ),
+                    128,
+                    dtype=np.uint8,
+                )
+                if self.publish_xyt_voxel
+                else None
+            )
         else:
             # preview_buffer keeps enough history for all outputs (mono + 3-channel).
             chunks = [ev for (_, _, ev) in snapshot]
@@ -922,6 +1072,19 @@ class OpenMVEventCamNode(Node):
                 frame_3ch = (
                     np.full((self.H, self.W, 3), 128, dtype=np.uint8)
                     if self.publish_3_channel_img
+                    else None
+                )
+                voxel = (
+                    np.full(
+                        (
+                            self.event_voxel_height,
+                            self.event_voxel_width,
+                            self.event_voxel_temporal_bins,
+                        ),
+                        128,
+                        dtype=np.uint8,
+                    )
+                    if self.publish_xyt_voxel
                     else None
                 )
             else:
@@ -960,6 +1123,22 @@ class OpenMVEventCamNode(Node):
                         self.step,
                     )
 
+                voxel = None
+                if self.publish_xyt_voxel:
+                    voxel, _voxel_counts = build_xyt_signed_voxel(
+                        events=chunk,
+                        event_ts_us=event_ts_us,
+                        anchor_t_us=now_event_t_us,
+                        sensor_width=self.W,
+                        sensor_height=self.H,
+                        output_width=self.event_voxel_width,
+                        output_height=self.event_voxel_height,
+                        horizon_ms=self.event_voxel_horizon_ms,
+                        temporal_bins=self.event_voxel_temporal_bins,
+                        scaling_mode=self.event_voxel_scaling,
+                        event_clip_count=self.event_voxel_clip_count,
+                    )
+
                 if self.print_log and (now - self._last_publish_debug_log_t) >= 3.0:
                     mono_count = int(np.count_nonzero(mono_mask))
                     full_count = int(chunk.shape[0])
@@ -969,7 +1148,9 @@ class OpenMVEventCamNode(Node):
                         f"full_buffered_events={full_count}, "
                         f"mono_window_ms={self.window_ms:.1f}, "
                         f"event_frame_windows_ms={self.event_frame_windows_ms}, "
-                        f"event_scaling={self.event_scaling}"
+                        f"event_scaling={self.event_scaling}, "
+                        f"publish_xyt_voxel={self.publish_xyt_voxel}, "
+                        f"event_voxel_horizon_ms={self.event_voxel_horizon_ms}"
                     )
                     self._last_publish_debug_log_t = now
 
@@ -989,12 +1170,26 @@ class OpenMVEventCamNode(Node):
             frame_3ch = rotate_event_frame(
                 frame_3ch, self.event_frame_rotation_degrees
             )
+        if voxel is not None:
+            voxel = rotate_event_frame(voxel, self.event_frame_rotation_degrees)
 
         self._publish_mono_image(frame)
         if self.publish_3_channel_img:
             if frame_3ch is None:
                 frame_3ch = np.full((self.H, self.W, 3), 128, dtype=np.uint8)
             self._publish_3ch_image(frame_3ch)
+        if self.publish_xyt_voxel:
+            if voxel is None:
+                voxel = np.full(
+                    (
+                        self.event_voxel_height,
+                        self.event_voxel_width,
+                        self.event_voxel_temporal_bins,
+                    ),
+                    128,
+                    dtype=np.uint8,
+                )
+            self._publish_xyt_image(voxel)
 
     def destroy_node(self):
         self._stop_event.set()

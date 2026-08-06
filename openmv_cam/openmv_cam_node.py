@@ -18,13 +18,18 @@ from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 
 from .event_frame_contract import (
+    build_event_activity_voxel,
     build_event_frame_3ch,
     build_xyt_signed_voxel,
+    has_new_event_data,
     render_event_frame_from_arrays,
     retention_history_ms,
     validate_event_contract_config,
+    validate_activity_voxel_config,
     validate_xyt_voxel_config,
 )
+from .event_diagnostics import EventDiagnosticCounters
+from .event_output_mode import resolve_event_outputs
 from .image_rotation import SUPPORTED_ROTATIONS_DEG, rotate_event_frame
 
 
@@ -52,6 +57,36 @@ def build_hwc9_image_message(
     msg.height = int(height)
     msg.width = int(width)
     msg.encoding = encoding
+    msg.is_bigendian = 0
+    msg.step = int(width * channels)
+    msg.data = image.tobytes(order="C")
+    return msg
+
+
+def build_activity_image_message(
+    image: np.ndarray,
+    *,
+    stamp,
+    frame_id: str = "openmv_cam",
+) -> Image:
+    """Serialize an HW/HWC uint8 activity voxel with an explicit ROS layout."""
+    if image.dtype != np.uint8:
+        raise ValueError(f"activity voxel must have dtype uint8, got {image.dtype}")
+    if image.ndim not in (2, 3):
+        raise ValueError(f"activity voxel must have shape (H, W) or (H, W, N), got {image.shape}")
+    if image.ndim == 3 and image.shape[2] < 2:
+        raise ValueError(f"HWC activity voxel must have at least 2 channels, got {image.shape}")
+    if not image.flags.c_contiguous:
+        raise ValueError("activity voxel must be C-contiguous")
+
+    height, width = image.shape[:2]
+    channels = 1 if image.ndim == 2 else image.shape[2]
+    msg = Image()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.height = int(height)
+    msg.width = int(width)
+    msg.encoding = f"8UC{channels}"
     msg.is_bigendian = 0
     msg.step = int(width * channels)
     msg.data = image.tobytes(order="C")
@@ -98,6 +133,14 @@ class OpenMVEventCamNode(Node):
         )
         self.declare_parameter("event_voxel_clip_count", 16.0)
         self.declare_parameter("event_voxel_encoding", "8UC9")
+        self.declare_parameter("publish_event_voxel_1ms", False)
+        self.declare_parameter("topic_event_voxel_1ms", "/openmv_cam/event_voxel_1ms")
+        self.declare_parameter("event_voxel_bin_ms", 1.0)
+        self.declare_parameter("event_voxel_activity_mode", "absolute_activity")
+        self.declare_parameter("event_voxel_publish_fps", 30.0)
+        self.declare_parameter("event_output_mode", "legacy_flags")
+        self.declare_parameter("event_diagnostics_enabled", False)
+        self.declare_parameter("event_diagnostics_period_sec", 5.0)
         self.declare_parameter("frame_id", "openmv_cam")
         self.declare_parameter("publish_fps", 30.0)
         self.declare_parameter("event_frame_rotation_degrees", 0)
@@ -142,6 +185,7 @@ class OpenMVEventCamNode(Node):
         self.event_voxel_temporal_bins = int(
             self.get_parameter("event_voxel_temporal_bins").value
         )
+        self.legacy_event_voxel_temporal_bins = 9
         self.event_voxel_height = int(self.get_parameter("event_voxel_height").value)
         self.event_voxel_width = int(self.get_parameter("event_voxel_width").value)
         self.event_voxel_scaling = str(
@@ -153,6 +197,28 @@ class OpenMVEventCamNode(Node):
         self.event_voxel_encoding = str(
             self.get_parameter("event_voxel_encoding").value
         ).strip()
+        self.publish_event_voxel_1ms = bool(
+            self.get_parameter("publish_event_voxel_1ms").value
+        )
+        self.topic_event_voxel_1ms = str(
+            self.get_parameter("topic_event_voxel_1ms").value
+        ).strip()
+        self.event_voxel_bin_ms = float(self.get_parameter("event_voxel_bin_ms").value)
+        self.event_voxel_activity_mode = str(
+            self.get_parameter("event_voxel_activity_mode").value
+        ).strip().lower()
+        self.event_voxel_publish_fps = float(
+            self.get_parameter("event_voxel_publish_fps").value
+        )
+        self.event_output_mode = str(
+            self.get_parameter("event_output_mode").value
+        ).strip().lower()
+        self.event_diagnostics_enabled = bool(
+            self.get_parameter("event_diagnostics_enabled").value
+        )
+        self.event_diagnostics_period_sec = float(
+            self.get_parameter("event_diagnostics_period_sec").value
+        )
         self.frame_id = self.get_parameter("frame_id").get_parameter_value().string_value
         self.publish_fps = self.get_parameter("publish_fps").get_parameter_value().double_value
         self.event_frame_rotation_degrees = (
@@ -175,7 +241,12 @@ class OpenMVEventCamNode(Node):
         self.blur_kernel = self.get_parameter("blur_kernel").get_parameter_value().integer_value
         self.sort_by_timestamp = self.get_parameter("sort_by_timestamp").get_parameter_value().bool_value
 
-        configured_topics = [self.topic, self.topic_3_channel, self.topic_xyt_voxel]
+        configured_topics = [
+            self.topic,
+            self.topic_3_channel,
+            self.topic_xyt_voxel,
+            self.topic_event_voxel_1ms,
+        ]
         if len(set(configured_topics)) != len(configured_topics):
             error_msg = "Mono, 3-channel, and XYT event image topics must be different."
             self.get_logger().error(error_msg)
@@ -206,7 +277,7 @@ class OpenMVEventCamNode(Node):
             self.event_voxel_width,
             self.event_voxel_height,
             self.event_voxel_horizon_ms,
-            self.event_voxel_temporal_bins,
+            self.legacy_event_voxel_temporal_bins,
             self.event_voxel_scaling,
             self.event_voxel_clip_count,
         ) = validate_xyt_voxel_config(
@@ -215,20 +286,49 @@ class OpenMVEventCamNode(Node):
             output_width=self.event_voxel_width,
             output_height=self.event_voxel_height,
             horizon_ms=self.event_voxel_horizon_ms,
-            temporal_bins=self.event_voxel_temporal_bins,
+            temporal_bins=self.legacy_event_voxel_temporal_bins,
             scaling_mode=self.event_voxel_scaling,
             event_clip_count=self.event_voxel_clip_count,
         )
-        if self.event_voxel_temporal_bins != 9:
-            raise ValueError(
-                "xyt_signed_voxel_v1 requires event_voxel_temporal_bins=9, "
-                f"got {self.event_voxel_temporal_bins}"
-            )
         if self.event_voxel_encoding != "8UC9":
             raise ValueError(
                 "xyt_signed_voxel_v1 requires event_voxel_encoding='8UC9', "
                 f"got {self.event_voxel_encoding!r}"
             )
+
+        (
+            _activity_width,
+            _activity_height,
+            _activity_bin_us,
+            self.event_voxel_temporal_bins,
+            self.event_voxel_activity_mode,
+            self.event_voxel_clip_count,
+        ) = validate_activity_voxel_config(
+            width=self.W,
+            height=self.H,
+            bin_ms=self.event_voxel_bin_ms,
+            temporal_bins=self.event_voxel_temporal_bins,
+            activity_mode=self.event_voxel_activity_mode,
+            clip_count=self.event_voxel_clip_count,
+        )
+        if not np.isfinite(self.event_voxel_publish_fps) or self.event_voxel_publish_fps <= 0.0:
+            raise ValueError("event_voxel_publish_fps must be positive and finite")
+        if (
+            not np.isfinite(self.event_diagnostics_period_sec)
+            or self.event_diagnostics_period_sec <= 0.0
+        ):
+            raise ValueError("event_diagnostics_period_sec must be positive and finite")
+
+        outputs = resolve_event_outputs(
+            self.event_output_mode,
+            publish_3_channel_img=self.publish_3_channel_img,
+            publish_xyt_voxel=self.publish_xyt_voxel,
+            publish_event_voxel_1ms=self.publish_event_voxel_1ms,
+        )
+        self.publish_mono_img = outputs.mono
+        self.publish_3_channel_img = outputs.event_frame_3ch
+        self.publish_xyt_voxel = outputs.legacy_voxel
+        self.publish_event_voxel_1ms = outputs.event_voxel_1ms
 
         self.raw_event_output_path = self.get_parameter("raw_event_output_path").get_parameter_value().string_value
         self.flush_every_packets = self.get_parameter("flush_every_packets").get_parameter_value().integer_value
@@ -242,11 +342,24 @@ class OpenMVEventCamNode(Node):
         self.pub_mono_img = None
         self.pub_3ch = None
         self.pub_xyt_voxel = None
+        self.pub_event_voxel_1ms = None
         self.publish_timer = None
+        self.event_voxel_timer = None
+        self.diagnostics_timer = None
         self._publishing_enabled = False
         self._preview_history_truncated_warned = False
         self._publisher_config_logged = False
         self._last_publish_debug_log_t = 0.0
+        self._event_data_generation = 0
+        self._last_activity_generation = 0
+        self._diagnostics = EventDiagnosticCounters()
+        self._last_activity_tick_monotonic = None
+        self._last_activity_publish_monotonic = None
+        self._last_activity_anchor_t_us = None
+        self._diagnostic_last_monotonic = time.monotonic()
+        self._diagnostic_last_packets = 0
+        self._diagnostic_last_events = 0
+        self._diagnostic_last_messages = 0
 
         self.serial_port = None
         self._open_serial()
@@ -331,6 +444,18 @@ class OpenMVEventCamNode(Node):
             f"encoding={self.event_frame_encoding} enabled={self.publish_3_channel_img}"
         )
         self.get_logger().info(
+            f"Native activity voxel topic: {self.topic_event_voxel_1ms} "
+            f"enabled={self.publish_event_voxel_1ms} bin_ms={self.event_voxel_bin_ms} "
+            f"bins={self.event_voxel_temporal_bins} mode={self.event_voxel_activity_mode} "
+            "order=oldest_to_newest frame_id=openmv_cam rotation=0"
+        )
+        self.get_logger().info(
+            f"Event output mode: {self.event_output_mode}; resolved "
+            f"mono={self.publish_mono_img}, 3ch={self.publish_3_channel_img}, "
+            f"legacy_voxel={self.publish_xyt_voxel}, "
+            f"event_voxel_1ms={self.publish_event_voxel_1ms}"
+        )
+        self.get_logger().info(
             f"XYT event voxel topic: {self.topic_xyt_voxel} "
             f"encoding={self.event_voxel_encoding} enabled={self.publish_xyt_voxel}"
         )
@@ -347,7 +472,7 @@ class OpenMVEventCamNode(Node):
         self.get_logger().info(
             "XYT live contract: "
             f"horizon_ms={self.event_voxel_horizon_ms}, "
-            f"temporal_bins={self.event_voxel_temporal_bins}, "
+            f"temporal_bins={self.legacy_event_voxel_temporal_bins}, "
             f"shape=({self.event_voxel_height},{self.event_voxel_width},9), "
             f"scaling={self.event_voxel_scaling}, "
             f"clip_count={self.event_voxel_clip_count}, "
@@ -597,7 +722,7 @@ class OpenMVEventCamNode(Node):
                 self._h5_packets_since_flush = 0
 
     def _ensure_publisher_and_timer(self):
-        if self.pub_mono_img is None:
+        if self.publish_mono_img and self.pub_mono_img is None:
             self.pub_mono_img = self.create_publisher(Image, self.topic, 10)
         if self.publish_3_channel_img and self.pub_3ch is None:
             self.pub_3ch = self.create_publisher(Image, self.topic_3_channel, 10)
@@ -605,8 +730,25 @@ class OpenMVEventCamNode(Node):
             self.pub_xyt_voxel = self.create_publisher(
                 Image, self.topic_xyt_voxel, 10
             )
-        if self.publish_timer is None:
+        if self.publish_event_voxel_1ms and self.pub_event_voxel_1ms is None:
+            self.pub_event_voxel_1ms = self.create_publisher(
+                Image, self.topic_event_voxel_1ms, 10
+            )
+        if (
+            (self.publish_mono_img or self.publish_3_channel_img or self.publish_xyt_voxel)
+            and self.publish_timer is None
+        ):
             self.publish_timer = self.create_timer(1.0 / self.publish_fps, self._publish_timer_cb)
+        if self.publish_event_voxel_1ms and self.event_voxel_timer is None:
+            self.event_voxel_timer = self.create_timer(
+                1.0 / self.event_voxel_publish_fps,
+                self._publish_activity_voxel_timer_cb,
+            )
+        if self.event_diagnostics_enabled and self.diagnostics_timer is None:
+            self.diagnostics_timer = self.create_timer(
+                self.event_diagnostics_period_sec,
+                self._diagnostics_timer_cb,
+            )
         if not self._publisher_config_logged:
             self.get_logger().info(
                 "Publishers configured: "
@@ -615,6 +757,8 @@ class OpenMVEventCamNode(Node):
                 f"publish_3_channel_img={self.publish_3_channel_img}, "
                 f"topic_xyt_voxel={self.topic_xyt_voxel}, "
                 f"publish_xyt_voxel={self.publish_xyt_voxel}"
+                f", topic_event_voxel_1ms={self.topic_event_voxel_1ms}"
+                f", publish_event_voxel_1ms={self.publish_event_voxel_1ms}"
             )
             self._publisher_config_logged = True
 
@@ -626,18 +770,35 @@ class OpenMVEventCamNode(Node):
             self.publish_timer.cancel()
             self.destroy_timer(self.publish_timer)
             self.publish_timer = None
+        if self.event_voxel_timer is not None:
+            self.event_voxel_timer.cancel()
+            self.destroy_timer(self.event_voxel_timer)
+            self.event_voxel_timer = None
+        if self.diagnostics_timer is not None:
+            self.diagnostics_timer.cancel()
+            self.destroy_timer(self.diagnostics_timer)
+            self.diagnostics_timer = None
 
         with self._preview_lock:
             self.preview_buffer.clear()
 
     def _buffer_history_limit_s(self) -> float:
+        detector_horizon_ms = (
+            self.event_voxel_bin_ms * self.event_voxel_temporal_bins
+            if self.publish_event_voxel_1ms
+            else 0.0
+        )
+        voxel_horizon_ms = max(
+            self.event_voxel_horizon_ms if self.publish_xyt_voxel else 0.0,
+            detector_horizon_ms,
+        )
         history_ms = retention_history_ms(
             mono_window_ms=self.window_ms,
             max_event_window_ms=max(self.event_frame_windows_ms),
             event_packet_margin_ms=self.event_packet_margin_ms,
             include_event_channels=self.publish_3_channel_img,
-            event_voxel_horizon_ms=self.event_voxel_horizon_ms,
-            include_event_voxel=self.publish_xyt_voxel,
+            event_voxel_horizon_ms=voxel_horizon_ms,
+            include_event_voxel=self.publish_xyt_voxel or self.publish_event_voxel_1ms,
         )
         return float(history_ms) / 1000.0
 
@@ -659,6 +820,8 @@ class OpenMVEventCamNode(Node):
             message += f"; XYT voxel topic {self.topic_xyt_voxel} active"
         else:
             message += "; XYT voxel publishing disabled"
+        if self.publish_event_voxel_1ms:
+            message += f"; native activity voxel topic {self.topic_event_voxel_1ms} active"
         self.get_logger().info(message)
         response.success = True
         response.message = ""
@@ -892,18 +1055,30 @@ class OpenMVEventCamNode(Node):
 
         safety_cap = (
             max(1, int(self.max_event_frame_packets))
-            if self.publish_3_channel_img or self.publish_xyt_voxel
+            if (
+                self.publish_3_channel_img
+                or self.publish_xyt_voxel
+                or self.publish_event_voxel_1ms
+            )
             else max(1, int(self.max_preview_packets))
         )
         if len(self.preview_buffer) > safety_cap:
             dropped = len(self.preview_buffer) - safety_cap
             for _ in range(dropped):
-                self.preview_buffer.popleft()
+                dropped_packet = self.preview_buffer.popleft()
+                self._diagnostics.packets_dropped_by_cap += 1
+                self._diagnostics.events_dropped_by_cap += int(
+                    dropped_packet[2].shape[0]
+                )
             if not self._preview_history_truncated_warned:
                 self.get_logger().warn(
                     "Preview buffer truncated by safety cap "
                     f"({safety_cap} packets); event-volume history may be incomplete."
-                    if self.publish_3_channel_img or self.publish_xyt_voxel
+                    if (
+                        self.publish_3_channel_img
+                        or self.publish_xyt_voxel
+                        or self.publish_event_voxel_1ms
+                    )
                     else f"Preview buffer truncated by safety cap ({safety_cap} packets)."
                 )
                 self._preview_history_truncated_warned = True
@@ -999,6 +1174,8 @@ class OpenMVEventCamNode(Node):
                 if self._publishing_enabled:
                     with self._preview_lock:
                         self.preview_buffer.append((now, packet_ros_t_ns, events))
+                        if event_count > 0:
+                            self._event_data_generation += 1
                         self._trim_preview_buffer_locked(now)
 
                 if now - self.last_stats_print >= 2.0:
@@ -1048,7 +1225,7 @@ class OpenMVEventCamNode(Node):
                     (
                         self.event_voxel_height,
                         self.event_voxel_width,
-                        self.event_voxel_temporal_bins,
+                        self.legacy_event_voxel_temporal_bins,
                     ),
                     128,
                     dtype=np.uint8,
@@ -1079,7 +1256,7 @@ class OpenMVEventCamNode(Node):
                         (
                             self.event_voxel_height,
                             self.event_voxel_width,
-                            self.event_voxel_temporal_bins,
+                            self.legacy_event_voxel_temporal_bins,
                         ),
                         128,
                         dtype=np.uint8,
@@ -1134,7 +1311,7 @@ class OpenMVEventCamNode(Node):
                         output_width=self.event_voxel_width,
                         output_height=self.event_voxel_height,
                         horizon_ms=self.event_voxel_horizon_ms,
-                        temporal_bins=self.event_voxel_temporal_bins,
+                        temporal_bins=self.legacy_event_voxel_temporal_bins,
                         scaling_mode=self.event_voxel_scaling,
                         event_clip_count=self.event_voxel_clip_count,
                     )
@@ -1173,7 +1350,8 @@ class OpenMVEventCamNode(Node):
         if voxel is not None:
             voxel = rotate_event_frame(voxel, self.event_frame_rotation_degrees)
 
-        self._publish_mono_image(frame)
+        if self.publish_mono_img:
+            self._publish_mono_image(frame)
         if self.publish_3_channel_img:
             if frame_3ch is None:
                 frame_3ch = np.full((self.H, self.W, 3), 128, dtype=np.uint8)
@@ -1184,12 +1362,151 @@ class OpenMVEventCamNode(Node):
                     (
                         self.event_voxel_height,
                         self.event_voxel_width,
-                        self.event_voxel_temporal_bins,
+                        self.legacy_event_voxel_temporal_bins,
                     ),
                     128,
                     dtype=np.uint8,
                 )
             self._publish_xyt_image(voxel)
+
+    def _publish_activity_voxel_timer_cb(self):
+        """Publish a rolling event-time voxel only after new non-empty input."""
+        tick_started = time.monotonic()
+        self._diagnostics.timer_ticks += 1
+        if self._last_activity_tick_monotonic is not None:
+            self._diagnostics.timer_interval.add_seconds(
+                tick_started - self._last_activity_tick_monotonic
+            )
+        self._last_activity_tick_monotonic = tick_started
+        if not self._publishing_enabled or self.pub_event_voxel_1ms is None:
+            return
+
+        processing_started = time.monotonic()
+        with self._preview_lock:
+            now = time.monotonic()
+            self._trim_preview_buffer_locked(now)
+            generation = self._event_data_generation
+            if not has_new_event_data(generation, self._last_activity_generation):
+                self._diagnostics.skipped_no_new_events += 1
+                return
+            snapshot = list(self.preview_buffer)
+
+        nonempty_packets = [item for item in snapshot if item[2].shape[0] > 0]
+        if not nonempty_packets:
+            self._diagnostics.skipped_no_new_events += 1
+            return
+
+        chunks = [events for _, _, events in nonempty_packets]
+        events = np.concatenate(chunks, axis=0)
+        event_ts_us = self.event_timestamps_us(events)
+        if event_ts_us.size == 0:
+            self._diagnostics.skipped_no_new_events += 1
+            return
+        anchor_t_us = int(np.max(event_ts_us))
+        self._diagnostics.buffer_processing.add_seconds(
+            time.monotonic() - processing_started
+        )
+        if (
+            self._last_activity_anchor_t_us is None
+            or anchor_t_us > self._last_activity_anchor_t_us
+        ):
+            self._diagnostics.anchors_advanced += 1
+        else:
+            self._diagnostics.anchors_repeated += 1
+        self._last_activity_anchor_t_us = anchor_t_us
+
+        # Use the host ROS receive stamp of the packet containing the anchor.
+        # This is the closest available mapping from sensor event time to ROS time.
+        anchor_packet_ros_t_ns = nonempty_packets[-1][1]
+        for _, packet_ros_t_ns, packet_events in nonempty_packets:
+            packet_ts = self.event_timestamps_us(packet_events)
+            if packet_ts.size and np.any(packet_ts == anchor_t_us):
+                anchor_packet_ros_t_ns = packet_ros_t_ns
+
+        voxel_started = time.monotonic()
+        voxel, _bin_counts = build_event_activity_voxel(
+            events,
+            event_ts_us,
+            anchor_t_us,
+            width=self.W,
+            height=self.H,
+            bin_ms=self.event_voxel_bin_ms,
+            temporal_bins=self.event_voxel_temporal_bins,
+            activity_mode=self.event_voxel_activity_mode,
+            clip_count=self.event_voxel_clip_count,
+        )
+        self._diagnostics.voxel_build.add_seconds(
+            time.monotonic() - voxel_started
+        )
+        stamp = rclpy.time.Time(nanoseconds=int(anchor_packet_ros_t_ns)).to_msg()
+        message_started = time.monotonic()
+        try:
+            msg = build_activity_image_message(
+                voxel,
+                stamp=stamp,
+                frame_id="openmv_cam",
+            )
+        except ValueError as error:
+            self.get_logger().error(
+                f"Refusing to publish activity voxel on {self.topic_event_voxel_1ms}: {error}"
+            )
+            return
+        self._diagnostics.message_build.add_seconds(
+            time.monotonic() - message_started
+        )
+        publish_started = time.monotonic()
+        self.pub_event_voxel_1ms.publish(msg)
+        publish_finished = time.monotonic()
+        self._diagnostics.publish_call.add_seconds(
+            publish_finished - publish_started
+        )
+        if self._last_activity_publish_monotonic is not None:
+            self._diagnostics.publish_interval.add_seconds(
+                publish_finished - self._last_activity_publish_monotonic
+            )
+        self._last_activity_publish_monotonic = publish_finished
+        self._last_activity_generation = generation
+        self._diagnostics.messages_published += 1
+
+    def _diagnostics_timer_cb(self):
+        """Emit throttled rate and timing diagnostics without per-event logs."""
+        now = time.monotonic()
+        elapsed = max(now - self._diagnostic_last_monotonic, 1e-9)
+        packets = self.total_packets - self._diagnostic_last_packets
+        events = self.total_events - self._diagnostic_last_events
+        messages = (
+            self._diagnostics.messages_published - self._diagnostic_last_messages
+        )
+        self._diagnostic_last_monotonic = now
+        self._diagnostic_last_packets = self.total_packets
+        self._diagnostic_last_events = self.total_events
+        self._diagnostic_last_messages = self._diagnostics.messages_published
+
+        def timing(name, samples):
+            p50, p95, maximum = samples.summary_ms()
+            return f"{name}_ms(p50/p95/max)={p50:.3f}/{p95:.3f}/{maximum:.3f}"
+
+        requested_interval_ms = 1_000.0 / self.event_voxel_publish_fps
+        self.get_logger().info(
+            "EVENT DIAGNOSTICS | "
+            f"input_packets_hz={packets / elapsed:.2f}, "
+            f"input_events_hz={events / elapsed:.1f}, "
+            f"internal_publish_hz={messages / elapsed:.2f}, "
+            f"requested_interval_ms={requested_interval_ms:.3f}, "
+            f"ticks={self._diagnostics.timer_ticks}, "
+            f"published={self._diagnostics.messages_published}, "
+            f"skipped_no_new={self._diagnostics.skipped_no_new_events}, "
+            f"anchors_advanced={self._diagnostics.anchors_advanced}, "
+            f"anchors_repeated={self._diagnostics.anchors_repeated}, "
+            f"dropped_packets={self._diagnostics.packets_dropped_by_cap}, "
+            f"dropped_events={self._diagnostics.events_dropped_by_cap}, "
+            f"{timing('timer_interval', self._diagnostics.timer_interval)}, "
+            f"{timing('buffer', self._diagnostics.buffer_processing)}, "
+            f"{timing('voxel', self._diagnostics.voxel_build)}, "
+            f"{timing('message', self._diagnostics.message_build)}, "
+            f"{timing('publish_call', self._diagnostics.publish_call)}, "
+            f"{timing('publish_interval', self._diagnostics.publish_interval)}"
+        )
 
     def destroy_node(self):
         self._stop_event.set()
@@ -1198,6 +1515,14 @@ class OpenMVEventCamNode(Node):
             self.publish_timer.cancel()
             self.destroy_timer(self.publish_timer)
             self.publish_timer = None
+        if self.event_voxel_timer is not None:
+            self.event_voxel_timer.cancel()
+            self.destroy_timer(self.event_voxel_timer)
+            self.event_voxel_timer = None
+        if self.diagnostics_timer is not None:
+            self.diagnostics_timer.cancel()
+            self.destroy_timer(self.diagnostics_timer)
+            self.diagnostics_timer = None
 
         with self._preview_lock:
             self.preview_buffer.clear()

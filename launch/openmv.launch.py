@@ -79,6 +79,35 @@ def generate_launch_description():
         "event_voxel_encoding",
         default_value="8UC9",
     )
+    publish_event_voxel_1ms_arg = DeclareLaunchArgument(
+        "publish_event_voxel_1ms", default_value="false"
+    )
+    topic_event_voxel_1ms_arg = DeclareLaunchArgument(
+        "topic_event_voxel_1ms", default_value="/openmv_cam/event_voxel_1ms"
+    )
+    event_voxel_bin_ms_arg = DeclareLaunchArgument(
+        "event_voxel_bin_ms", default_value="1.0"
+    )
+    event_voxel_activity_mode_arg = DeclareLaunchArgument(
+        "event_voxel_activity_mode", default_value="absolute_activity"
+    )
+    event_voxel_publish_fps_arg = DeclareLaunchArgument(
+        "event_voxel_publish_fps", default_value="30.0"
+    )
+    event_output_mode_arg = DeclareLaunchArgument(
+        "event_output_mode",
+        default_value="legacy_flags",
+        description=(
+            "Event image outputs: legacy_flags preserves publish flags; "
+            "event_voxel_1ms, all, and none are explicit overrides"
+        ),
+    )
+    event_diagnostics_enabled_arg = DeclareLaunchArgument(
+        "event_diagnostics_enabled", default_value="false"
+    )
+    event_diagnostics_period_sec_arg = DeclareLaunchArgument(
+        "event_diagnostics_period_sec", default_value="5.0"
+    )
 
     openmv_params = dict(OPENMV_PARAMS)
     openmv_params.update({
@@ -98,6 +127,18 @@ def generate_launch_description():
         "event_voxel_scaling": LaunchConfiguration("event_voxel_scaling"),
         "event_voxel_clip_count": LaunchConfiguration("event_voxel_clip_count"),
         "event_voxel_encoding": LaunchConfiguration("event_voxel_encoding"),
+        "publish_event_voxel_1ms": LaunchConfiguration("publish_event_voxel_1ms"),
+        "topic_event_voxel_1ms": LaunchConfiguration("topic_event_voxel_1ms"),
+        "event_voxel_bin_ms": LaunchConfiguration("event_voxel_bin_ms"),
+        "event_voxel_activity_mode": LaunchConfiguration("event_voxel_activity_mode"),
+        "event_voxel_publish_fps": LaunchConfiguration("event_voxel_publish_fps"),
+        "event_output_mode": LaunchConfiguration("event_output_mode"),
+        "event_diagnostics_enabled": LaunchConfiguration(
+            "event_diagnostics_enabled"
+        ),
+        "event_diagnostics_period_sec": LaunchConfiguration(
+            "event_diagnostics_period_sec"
+        ),
     })
 
     xyt_log = LogInfo(msg=[
@@ -110,6 +151,17 @@ def generate_launch_description():
         ", scaling=", LaunchConfiguration("event_voxel_scaling"),
         ", clip_count=", LaunchConfiguration("event_voxel_clip_count"),
         ", encoding=", LaunchConfiguration("event_voxel_encoding"),
+    ])
+    activity_log = LogInfo(msg=[
+        "OpenMV native activity voxel: enabled=",
+        LaunchConfiguration("publish_event_voxel_1ms"),
+        ", topic=", LaunchConfiguration("topic_event_voxel_1ms"),
+        ", bin_ms=", LaunchConfiguration("event_voxel_bin_ms"),
+        ", bins=", LaunchConfiguration("event_voxel_temporal_bins"),
+        ", mode=", LaunchConfiguration("event_voxel_activity_mode"),
+        ", clip_count=", LaunchConfiguration("event_voxel_clip_count"),
+        ", publish_fps=", LaunchConfiguration("event_voxel_publish_fps"),
+        ", output_mode=", LaunchConfiguration("event_output_mode"),
     ])
 
     openmv_node = Node(
@@ -137,6 +189,15 @@ def generate_launch_description():
         event_voxel_scaling_arg,
         event_voxel_clip_count_arg,
         event_voxel_encoding_arg,
+        publish_event_voxel_1ms_arg,
+        topic_event_voxel_1ms_arg,
+        event_voxel_bin_ms_arg,
+        event_voxel_activity_mode_arg,
+        event_voxel_publish_fps_arg,
+        event_output_mode_arg,
+        event_diagnostics_enabled_arg,
+        event_diagnostics_period_sec_arg,
         xyt_log,
+        activity_log,
         openmv_node,
     ])

@@ -11,6 +11,12 @@ SUPPORTED_EVENT_SCALING = (
     "signed_log1p_fixed_clip",
 )
 SUPPORTED_EVENT_FRAME_MODE = ("cumulative", "shifted")
+SUPPORTED_ACTIVITY_MODE = ("absolute_activity", "signed_activity")
+
+
+def has_new_event_data(generation: int, last_published_generation: int) -> bool:
+    """Return whether a timer tick has newly buffered non-empty event data."""
+    return int(generation) != int(last_published_generation)
 
 
 @dataclass(frozen=True)
@@ -262,6 +268,130 @@ def build_xyt_signed_voxel(
     normalized = np.clip(normalized, -1.0, 1.0)
     voxel = np.rint(128.0 + 127.0 * normalized).astype(np.uint8)
     return np.ascontiguousarray(voxel), counts
+
+
+def validate_activity_voxel_config(
+    *,
+    width: int,
+    height: int,
+    bin_ms: float,
+    temporal_bins: int,
+    activity_mode: str,
+    clip_count: float,
+) -> Tuple[int, int, int, int, str, float]:
+    """Validate the native event-camera activity voxel configuration."""
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"width and height must be positive, got ({width}, {height})")
+
+    bin_us_float = float(bin_ms) * 1_000.0
+    bin_us = int(round(bin_us_float))
+    if not np.isfinite(bin_us_float) or bin_us <= 0 or not np.isclose(
+        bin_us_float, bin_us
+    ):
+        raise ValueError(
+            "event_voxel_bin_ms must be a positive whole number of microseconds, "
+            f"got {bin_ms}"
+        )
+
+    bins = int(temporal_bins)
+    if bins <= 0 or bins != temporal_bins:
+        raise ValueError(f"temporal_bins must be a positive integer, got {temporal_bins}")
+
+    mode = str(activity_mode).strip().lower()
+    if mode not in SUPPORTED_ACTIVITY_MODE:
+        raise ValueError(
+            f"Unsupported activity_mode {mode!r}; expected one of {SUPPORTED_ACTIVITY_MODE}"
+        )
+
+    clip = float(clip_count)
+    if not np.isfinite(clip) or clip <= 0.0:
+        raise ValueError(f"clip_count must be positive and finite, got {clip_count}")
+    return width, height, bin_us, bins, mode, clip
+
+
+def build_event_activity_voxel(
+    events: np.ndarray,
+    event_ts_us: np.ndarray,
+    anchor_t_us: int,
+    *,
+    width: int,
+    height: int,
+    bin_ms: float,
+    temporal_bins: int,
+    activity_mode: str,
+    clip_count: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build a causal native-coordinate activity voxel, oldest bin first.
+
+    Bin intervals are right-closed: for depth N the retained interval is
+    ``(anchor - N * bin_us, anchor]``. Internal boundary events enter the
+    older bin. A one-bin result is returned as HW; multiple bins use HWC.
+    """
+    width, height, bin_us, bins, mode, clip = validate_activity_voxel_config(
+        width=width,
+        height=height,
+        bin_ms=bin_ms,
+        temporal_bins=temporal_bins,
+        activity_mode=activity_mode,
+        clip_count=clip_count,
+    )
+    shape = (height, width, bins)
+    accumulation = np.zeros(shape, dtype=np.int32)
+    bin_counts = np.zeros((bins,), dtype=np.int32)
+    if events.size == 0 or event_ts_us.size == 0:
+        result = accumulation[:, :, 0] if bins == 1 else accumulation
+        return np.ascontiguousarray(result.astype(np.uint8)), bin_counts
+
+    events_array = np.asarray(events)
+    timestamps = np.asarray(event_ts_us, dtype=np.int64)
+    if events_array.ndim != 2 or events_array.shape[1] < 6:
+        raise ValueError(f"events must have shape (N, >=6), got {events_array.shape}")
+    if timestamps.ndim != 1 or timestamps.shape[0] != events_array.shape[0]:
+        raise ValueError(
+            "event_ts_us must be one-dimensional and match the event count, "
+            f"got events={events_array.shape[0]}, timestamps={timestamps.shape}"
+        )
+
+    anchor = int(anchor_t_us)
+    start = anchor - bins * bin_us
+    xs = events_array[:, 4].astype(np.int64, copy=False)
+    ys = events_array[:, 5].astype(np.int64, copy=False)
+    valid = (
+        (timestamps > start)
+        & (timestamps <= anchor)
+        & (xs >= 0)
+        & (xs < width)
+        & (ys >= 0)
+        & (ys < height)
+    )
+    if not np.any(valid):
+        result = accumulation[:, :, 0] if bins == 1 else accumulation
+        return np.ascontiguousarray(result.astype(np.uint8)), bin_counts
+
+    selected_ts = timestamps[valid]
+    selected_x = xs[valid]
+    selected_y = ys[valid]
+    # Right-closed bins: anchor itself is in the newest bin and an event
+    # exactly one bin before anchor remains in the preceding bin.
+    temporal_index = bins - 1 - ((anchor - selected_ts) // bin_us)
+    bin_counts = np.bincount(temporal_index, minlength=bins).astype(np.int32)
+    flat_index = (selected_y * width + selected_x) * bins + temporal_index
+    if mode == "absolute_activity":
+        contribution = np.ones(selected_ts.shape, dtype=np.int32)
+    else:
+        contribution = np.where(events_array[valid, 0] == 1, 1, -1).astype(np.int32)
+    np.add.at(accumulation.ravel(), flat_index, contribution)
+
+    if mode == "absolute_activity":
+        magnitude = accumulation.astype(np.float64)
+    else:
+        magnitude = np.abs(accumulation).astype(np.float64)
+    output = np.rint(255.0 * np.minimum(magnitude, clip) / clip).astype(np.uint8)
+    result = output[:, :, 0] if bins == 1 else output
+    return np.ascontiguousarray(result), bin_counts
 
 
 def build_time_ranges_us(

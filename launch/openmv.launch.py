@@ -108,6 +108,33 @@ def generate_launch_description():
     event_diagnostics_period_sec_arg = DeclareLaunchArgument(
         "event_diagnostics_period_sec", default_value="5.0"
     )
+    tracker_defaults = {
+        "event_tracker_enabled": "false",
+        "event_tracker_position_topic": "/openmv_cam/event_tracker/ball_2d_px",
+        "event_tracker_velocity_topic": "/openmv_cam/event_tracker/ball_velocity_px_s",
+        "event_tracker_valid_topic": "/openmv_cam/event_tracker/valid",
+        "event_tracker_bin_ms": "1.0",
+        "event_tracker_history_limit_ms": "100.0",
+        "event_tracker_activity_threshold": "1",
+        "event_tracker_min_event_count": "3",
+        "event_tracker_min_blob_area_px": "2",
+        "event_tracker_max_blob_area_px": "500",
+        "event_tracker_morphology_kernel": "0",
+        "event_tracker_morphology_iterations": "0",
+        "event_tracker_use_circularity": "false",
+        "event_tracker_min_circularity": "0.1",
+        "event_tracker_max_jump_px": "100.0",
+        "event_tracker_velocity_history_size": "5",
+        "event_tracker_velocity_min_span_ms": "3.0",
+        "event_tracker_stats_period_sec": "5.0",
+        "publish_latency_traces": "false",
+        "latency_trace_topic": "/intercept_trace/event_2d_ball_detection",
+        "latency_trace_run_id": "",
+    }
+    tracker_args = [
+        DeclareLaunchArgument(name, default_value=default)
+        for name, default in tracker_defaults.items()
+    ]
 
     openmv_params = dict(OPENMV_PARAMS)
     openmv_params.update({
@@ -139,6 +166,9 @@ def generate_launch_description():
         "event_diagnostics_period_sec": LaunchConfiguration(
             "event_diagnostics_period_sec"
         ),
+    })
+    openmv_params.update({
+        name: LaunchConfiguration(name) for name in tracker_defaults
     })
 
     xyt_log = LogInfo(msg=[
@@ -197,6 +227,7 @@ def generate_launch_description():
         event_output_mode_arg,
         event_diagnostics_enabled_arg,
         event_diagnostics_period_sec_arg,
+        *tracker_args,
         xyt_log,
         activity_log,
         openmv_node,

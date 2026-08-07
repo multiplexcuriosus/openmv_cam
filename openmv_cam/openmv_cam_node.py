@@ -15,7 +15,10 @@ import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import PointStamped, Vector3Stamped
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from .event_frame_contract import (
     build_event_activity_voxel,
@@ -31,6 +34,8 @@ from .event_frame_contract import (
 from .event_diagnostics import EventDiagnosticCounters
 from .event_output_mode import resolve_event_outputs
 from .image_rotation import SUPPORTED_ROTATIONS_DEG, rotate_event_frame
+from .event_ball_tracker import EventBallTracker, trace_detail_json
+from .evt1_protocol import EventPacket, MAX_EVENT_COUNT, reconstruct_timestamps_us
 
 
 def build_hwc9_image_message(
@@ -145,6 +150,36 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("publish_fps", 30.0)
         self.declare_parameter("event_frame_rotation_degrees", 0)
 
+        # Raw-packet event ball tracker (native, unrotated OpenMV coordinates).
+        self.declare_parameter("event_tracker_enabled", False)
+        self.declare_parameter(
+            "event_tracker_position_topic",
+            "/openmv_cam/event_tracker/ball_2d_px")
+        self.declare_parameter(
+            "event_tracker_velocity_topic",
+            "/openmv_cam/event_tracker/ball_velocity_px_s")
+        self.declare_parameter(
+            "event_tracker_valid_topic", "/openmv_cam/event_tracker/valid")
+        self.declare_parameter("event_tracker_bin_ms", 1.0)
+        self.declare_parameter("event_tracker_history_limit_ms", 100.0)
+        self.declare_parameter("event_tracker_activity_threshold", 1)
+        self.declare_parameter("event_tracker_min_event_count", 3)
+        self.declare_parameter("event_tracker_min_blob_area_px", 2)
+        self.declare_parameter("event_tracker_max_blob_area_px", 500)
+        self.declare_parameter("event_tracker_morphology_kernel", 0)
+        self.declare_parameter("event_tracker_morphology_iterations", 0)
+        self.declare_parameter("event_tracker_use_circularity", False)
+        self.declare_parameter("event_tracker_min_circularity", 0.1)
+        self.declare_parameter("event_tracker_max_jump_px", 100.0)
+        self.declare_parameter("event_tracker_velocity_history_size", 5)
+        self.declare_parameter("event_tracker_velocity_min_span_ms", 3.0)
+        self.declare_parameter("event_tracker_stats_period_sec", 5.0)
+        self.declare_parameter("publish_latency_traces", False)
+        self.declare_parameter(
+            "latency_trace_topic",
+            "/intercept_trace/event_2d_ball_detection")
+        self.declare_parameter("latency_trace_run_id", "")
+
         # Preview/render params
         self.declare_parameter("window_ms", 100.0)
         self.declare_parameter("max_preview_packets", 10)
@@ -226,6 +261,73 @@ class OpenMVEventCamNode(Node):
             .get_parameter_value()
             .integer_value
         )
+        self.event_tracker_enabled = bool(
+            self.get_parameter("event_tracker_enabled").value)
+        self.event_tracker_stats_period_sec = float(
+            self.get_parameter("event_tracker_stats_period_sec").value)
+        self.event_tracker = None
+        self.event_tracker_stats_timer = None
+        self.event_tracker_position_pub = None
+        self.event_tracker_velocity_pub = None
+        self.event_tracker_valid_pub = None
+        self.latency_trace_pub = None
+        self.LatencyTrace = None
+        self._tracker_trace_sequence = 0
+        if self.event_tracker_enabled:
+            self.event_tracker = EventBallTracker(
+                width=self.W, height=self.H,
+                bin_ms=float(self.get_parameter("event_tracker_bin_ms").value),
+                history_limit_ms=float(
+                    self.get_parameter("event_tracker_history_limit_ms").value),
+                activity_threshold=int(
+                    self.get_parameter("event_tracker_activity_threshold").value),
+                min_event_count=int(
+                    self.get_parameter("event_tracker_min_event_count").value),
+                min_blob_area_px=int(
+                    self.get_parameter("event_tracker_min_blob_area_px").value),
+                max_blob_area_px=int(
+                    self.get_parameter("event_tracker_max_blob_area_px").value),
+                morphology_kernel=int(
+                    self.get_parameter("event_tracker_morphology_kernel").value),
+                morphology_iterations=int(self.get_parameter(
+                    "event_tracker_morphology_iterations").value),
+                use_circularity=bool(
+                    self.get_parameter("event_tracker_use_circularity").value),
+                min_circularity=float(
+                    self.get_parameter("event_tracker_min_circularity").value),
+                max_jump_px=float(
+                    self.get_parameter("event_tracker_max_jump_px").value),
+                velocity_history_size=int(self.get_parameter(
+                    "event_tracker_velocity_history_size").value),
+                velocity_min_span_ms=float(self.get_parameter(
+                    "event_tracker_velocity_min_span_ms").value),
+            )
+            self.event_tracker_position_pub = self.create_publisher(
+                PointStamped,
+                str(self.get_parameter("event_tracker_position_topic").value),
+                10)
+            self.event_tracker_velocity_pub = self.create_publisher(
+                Vector3Stamped,
+                str(self.get_parameter("event_tracker_velocity_topic").value),
+                10)
+            self.event_tracker_valid_pub = self.create_publisher(
+                Bool, str(self.get_parameter("event_tracker_valid_topic").value),
+                10)
+            self.event_tracker_stats_timer = self.create_timer(
+                self.event_tracker_stats_period_sec, self._event_tracker_stats_cb)
+            if bool(self.get_parameter("publish_latency_traces").value):
+                try:
+                    from intercept_latency_monitor.msg import LatencyTrace
+                    self.LatencyTrace = LatencyTrace
+                    qos = QoSProfile(
+                        depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+                    self.latency_trace_pub = self.create_publisher(
+                        LatencyTrace,
+                        str(self.get_parameter("latency_trace_topic").value), qos)
+                except ImportError as error:
+                    self.get_logger().error(
+                        "Latency tracing requested but intercept_latency_monitor is unavailable; "
+                        f"tracing disabled: {error}")
 
         if self.event_frame_rotation_degrees not in SUPPORTED_ROTATIONS_DEG:
             raise ValueError(
@@ -368,7 +470,7 @@ class OpenMVEventCamNode(Node):
         self._preview_lock = threading.Lock()
         self._h5_lock = threading.Lock()
 
-        # stores tuples: (host_arrival_time_monotonic, packet_ros_time_ns, events_ndarray)
+        # Stores tuples: (host_arrival_time_monotonic, validated EventPacket).
         self.preview_buffer = deque()
 
         self._recording_enabled = False
@@ -639,15 +741,13 @@ class OpenMVEventCamNode(Node):
 
     def _append_packet_to_h5(
         self,
-        events: np.ndarray,
-        packet_id: int,  # no longer used; can remove later
-        packet_ros_t_ns: int,
-        packet_mono_t_ns: int,
+        packet: EventPacket,
     ):
+        events = packet.events
         event_count = int(events.shape[0])
         if event_count >= 8192:
             print("WARNING: event buffer saturated")
-        event_t_us = self.event_timestamps_us(events) if event_count > 0 else None
+        event_t_us = packet.timestamps_us if event_count > 0 else None
 
         if event_count > 0:
             packet_first_event_t_us = int(event_t_us[0])
@@ -705,8 +805,10 @@ class OpenMVEventCamNode(Node):
             self._h5_packets_first_event_t_us.resize((packet_new_idx,))
             self._h5_packets_last_event_t_us.resize((packet_new_idx,))
 
-            self._h5_packets_ros_t_ns[packet_idx] = np.int64(packet_ros_t_ns)
-            self._h5_packets_monotonic_t_ns[packet_idx] = np.int64(packet_mono_t_ns)
+            self._h5_packets_ros_t_ns[packet_idx] = np.int64(
+                packet.packet_ros_stamp_ns)
+            self._h5_packets_monotonic_t_ns[packet_idx] = np.int64(
+                packet.packet_monotonic_stamp_ns)
             self._h5_packets_start_event_idx[packet_idx] = np.int64(old_n)
             self._h5_packets_end_event_idx[packet_idx] = np.int64(new_n)
             self._h5_packets_event_count[packet_idx] = np.int64(event_count)
@@ -942,11 +1044,7 @@ class OpenMVEventCamNode(Node):
           2: ms
           3: us
         """
-        return (
-            events[:, 1].astype(np.int64) * 1_000_000
-            + events[:, 2].astype(np.int64) * 1_000
-            + events[:, 3].astype(np.int64)
-        )
+        return reconstruct_timestamps_us(events)
 
     def sort_events_by_timestamp_fn(self, events: np.ndarray) -> np.ndarray:
         if events.size == 0:
@@ -1068,7 +1166,7 @@ class OpenMVEventCamNode(Node):
                 dropped_packet = self.preview_buffer.popleft()
                 self._diagnostics.packets_dropped_by_cap += 1
                 self._diagnostics.events_dropped_by_cap += int(
-                    dropped_packet[2].shape[0]
+                    dropped_packet[1].event_count
                 )
             if not self._preview_history_truncated_warned:
                 self.get_logger().warn(
@@ -1127,12 +1225,110 @@ class OpenMVEventCamNode(Node):
             return
         self.pub_xyt_voxel.publish(msg)
 
+    def _publish_tracker_trace(self, *, event, sequence, parent_sequence,
+                               source_stamp_ns, receipt_ros_stamp_ns,
+                               start_ros_stamp_ns, end_ros_stamp_ns,
+                               start_steady_ns, end_steady_ns, valid,
+                               scalar_value=0.0, detail_json="{}"):
+        if self.latency_trace_pub is None:
+            return
+        msg = self.LatencyTrace()
+        msg.run_id = str(self.get_parameter("latency_trace_run_id").value)
+        msg.stage = "event_2d_ball_detection"
+        msg.event = event
+        msg.modality = "event"
+        msg.node_name = self.get_name()
+        msg.sequence = int(sequence)
+        msg.parent_sequence = int(parent_sequence)
+        msg.source_stamp_ns = int(source_stamp_ns)
+        msg.receipt_ros_stamp_ns = int(receipt_ros_stamp_ns)
+        msg.start_ros_stamp_ns = int(start_ros_stamp_ns)
+        msg.end_ros_stamp_ns = int(end_ros_stamp_ns)
+        msg.start_steady_ns = int(start_steady_ns)
+        msg.end_steady_ns = int(end_steady_ns)
+        msg.valid = bool(valid)
+        msg.scalar_value = float(scalar_value)
+        msg.detail_json = detail_json
+        self.latency_trace_pub.publish(msg)
+
+    def _handle_tracker_packet(self, packet: EventPacket):
+        if self.event_tracker is None:
+            return
+        start_ros_ns = int(self.get_clock().now().nanoseconds)
+        self._publish_tracker_trace(
+            event="input", sequence=packet.packet_id, parent_sequence=0,
+            source_stamp_ns=packet.packet_ros_stamp_ns,
+            receipt_ros_stamp_ns=packet.packet_ros_stamp_ns,
+            start_ros_stamp_ns=start_ros_ns, end_ros_stamp_ns=start_ros_ns,
+            start_steady_ns=packet.packet_monotonic_stamp_ns,
+            end_steady_ns=packet.packet_monotonic_stamp_ns,
+            valid=packet.event_count > 0,
+            scalar_value=float(packet.event_count),
+            detail_json=(
+                '{"sensor_timestamp_domain":"genx320_microseconds",'
+                f'"first_event_timestamp_us":{packet.first_event_timestamp_us},'
+                f'"last_event_timestamp_us":{packet.last_event_timestamp_us},'
+                f'"event_count":{packet.event_count}' + '}'))
+        detections = self.event_tracker.update(packet)
+        for detection in detections:
+            self._tracker_trace_sequence += 1
+            if detection.valid:
+                stamp = self.get_clock().now().to_msg()
+                position = PointStamped()
+                position.header.stamp = stamp
+                position.header.frame_id = "openmv_cam"
+                position.point.x = detection.x_px
+                position.point.y = detection.y_px
+                velocity = Vector3Stamped()
+                velocity.header.stamp = stamp
+                velocity.header.frame_id = "openmv_cam"
+                velocity.vector.x = detection.vx_px_s
+                velocity.vector.y = detection.vy_px_s
+                velocity.vector.z = detection.speed_px_s
+                self.event_tracker_position_pub.publish(position)
+                self.event_tracker_velocity_pub.publish(velocity)
+                valid = Bool()
+                valid.data = True
+                self.event_tracker_valid_pub.publish(valid)
+            end_ros_ns = int(self.get_clock().now().nanoseconds)
+            self._publish_tracker_trace(
+                event="complete", sequence=self._tracker_trace_sequence,
+                parent_sequence=detection.parent_packet_id,
+                source_stamp_ns=packet.packet_ros_stamp_ns,
+                receipt_ros_stamp_ns=packet.packet_ros_stamp_ns,
+                start_ros_stamp_ns=start_ros_ns, end_ros_stamp_ns=end_ros_ns,
+                start_steady_ns=detection.start_steady_ns,
+                end_steady_ns=detection.end_steady_ns, valid=detection.valid,
+                scalar_value=detection.confidence,
+                detail_json=trace_detail_json(detection))
+
+    def _event_tracker_stats_cb(self):
+        stats = self.event_tracker.statistics()
+        timing_names = ("map_build", "blob_detection", "computation",
+                        "velocity_fit", "total_tracker_update")
+        timings = " ".join(
+            f"{name}_p50/p95/max_ms={stats[name][0]:.3f}/{stats[name][1]:.3f}/{stats[name][2]:.3f}"
+            for name in timing_names)
+        keys = ("packets_received", "packets_with_events", "processed_1ms_bins",
+                "empty_bins", "late_events_or_bins", "candidate_blob_count",
+                "valid_detections", "invalid_detections", "velocity_ready_count")
+        counts = " ".join(f"{key}={stats.get(key, 0)}" for key in keys)
+        self.get_logger().info(
+            "EVENT TRACKER STATS | " + counts +
+            f" event_rate_hz={stats['event_rate_hz']:.1f}"
+            f" position_output_rate_hz={stats['position_output_rate_hz']:.2f}"
+            f" detection_rate_hz={stats['detection_rate_hz']:.2f} " + timings)
+
     def _reader_loop(self):
         while not self._stop_event.is_set():
             try:
                 self._read_until_magic()
                 header_rest = self._read_exactly(struct.calcsize(self.HEADER_FMT))
                 event_count, payload_len = struct.unpack(self.HEADER_FMT, header_rest)
+
+                if event_count > MAX_EVENT_COUNT:
+                    raise RuntimeError(
+                        f"Invalid event count: {event_count} exceeds {MAX_EVENT_COUNT}")
 
                 expected_len = event_count * 6 * 2
                 if payload_len != expected_len:
@@ -1141,14 +1337,18 @@ class OpenMVEventCamNode(Node):
                     )
 
                 payload = self._read_exactly(payload_len)
-                events = np.frombuffer(payload, dtype=np.uint16).reshape((event_count, 6)).copy()
-
+                # Host receipt is sampled only once the complete EVT1 packet is available.
                 packet_ros_t_ns = int(self.get_clock().now().nanoseconds)
                 packet_mono_t_ns = int(time.monotonic_ns())
 
                 now = time.monotonic()
-                packet_id = int(self.total_packets)
                 self.total_packets += 1
+                packet_id = int(self.total_packets)
+                packet = EventPacket.decode(
+                    payload, event_count=event_count, payload_length=payload_len,
+                    packet_id=packet_id, packet_ros_stamp_ns=packet_ros_t_ns,
+                    packet_monotonic_stamp_ns=packet_mono_t_ns)
+                events = packet.events
                 self.total_events += event_count
                 self.total_payload_bytes += payload_len
                 self.total_protocol_bytes += payload_len + self.HEADER_SIZE
@@ -1164,16 +1364,13 @@ class OpenMVEventCamNode(Node):
 
 
                 if self._recording_enabled:
-                    self._append_packet_to_h5(
-                        events,
-                        packet_id=packet_id,
-                        packet_ros_t_ns=packet_ros_t_ns,
-                        packet_mono_t_ns=packet_mono_t_ns,
-                    )
+                    self._append_packet_to_h5(packet)
+
+                self._handle_tracker_packet(packet)
 
                 if self._publishing_enabled:
                     with self._preview_lock:
-                        self.preview_buffer.append((now, packet_ros_t_ns, events))
+                        self.preview_buffer.append((now, packet))
                         if event_count > 0:
                             self._event_data_generation += 1
                         self._trim_preview_buffer_locked(now)
@@ -1235,14 +1432,15 @@ class OpenMVEventCamNode(Node):
             )
         else:
             # preview_buffer keeps enough history for all outputs (mono + 3-channel).
-            chunks = [ev for (_, _, ev) in snapshot]
+            chunks = [packet.events for _, packet in snapshot]
+            timestamp_chunks = [packet.timestamps_us for _, packet in snapshot]
             chunk = np.concatenate(chunks, axis=0)
+            event_ts_us = np.concatenate(timestamp_chunks, axis=0)
 
             if self.sort_by_timestamp:
-                chunk = self.sort_events_by_timestamp_fn(chunk)
-
-            # Compute event timestamps once from the shared chunk.
-            event_ts_us = self.event_timestamps_us(chunk)
+                order = np.argsort(event_ts_us, kind="stable")
+                chunk = chunk[order]
+                event_ts_us = event_ts_us[order]
 
             if event_ts_us.size == 0:
                 frame = np.full((self.H, self.W), 128, dtype=np.uint8)
@@ -1391,14 +1589,15 @@ class OpenMVEventCamNode(Node):
                 return
             snapshot = list(self.preview_buffer)
 
-        nonempty_packets = [item for item in snapshot if item[2].shape[0] > 0]
+        nonempty_packets = [item for item in snapshot if item[1].event_count > 0]
         if not nonempty_packets:
             self._diagnostics.skipped_no_new_events += 1
             return
 
-        chunks = [events for _, _, events in nonempty_packets]
+        chunks = [packet.events for _, packet in nonempty_packets]
         events = np.concatenate(chunks, axis=0)
-        event_ts_us = self.event_timestamps_us(events)
+        event_ts_us = np.concatenate(
+            [packet.timestamps_us for _, packet in nonempty_packets], axis=0)
         if event_ts_us.size == 0:
             self._diagnostics.skipped_no_new_events += 1
             return
@@ -1417,11 +1616,10 @@ class OpenMVEventCamNode(Node):
 
         # Use the host ROS receive stamp of the packet containing the anchor.
         # This is the closest available mapping from sensor event time to ROS time.
-        anchor_packet_ros_t_ns = nonempty_packets[-1][1]
-        for _, packet_ros_t_ns, packet_events in nonempty_packets:
-            packet_ts = self.event_timestamps_us(packet_events)
-            if packet_ts.size and np.any(packet_ts == anchor_t_us):
-                anchor_packet_ros_t_ns = packet_ros_t_ns
+        anchor_packet_ros_t_ns = nonempty_packets[-1][1].packet_ros_stamp_ns
+        for _, packet in nonempty_packets:
+            if np.any(packet.timestamps_us == anchor_t_us):
+                anchor_packet_ros_t_ns = packet.packet_ros_stamp_ns
 
         voxel_started = time.monotonic()
         voxel, _bin_counts = build_event_activity_voxel(
@@ -1523,6 +1721,10 @@ class OpenMVEventCamNode(Node):
             self.diagnostics_timer.cancel()
             self.destroy_timer(self.diagnostics_timer)
             self.diagnostics_timer = None
+        if self.event_tracker_stats_timer is not None:
+            self.event_tracker_stats_timer.cancel()
+            self.destroy_timer(self.event_tracker_stats_timer)
+            self.event_tracker_stats_timer = None
 
         with self._preview_lock:
             self.preview_buffer.clear()

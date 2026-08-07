@@ -1,5 +1,77 @@
 # OpenMV event camera ROS node
 
+## Raw-packet event ball tracker MVP
+
+The optional event tracker detects a high-activity ball-like blob directly in
+validated EVT1 packets. Its path is `EVT1 serial -> EventPacket -> sensor-time
+1 ms bins -> activity map -> blob/velocity estimate`. It runs in the serial
+reader path: it does not subscribe to `/openmv_cam/event_voxel_1ms` and does not
+wait for the 30 Hz image timer. The same timestamp-ordered `EventPacket` is
+shared with preview buffering and HDF5 recording, so EVT1 timestamps are
+reconstructed once. Wire order is retained for compatibility; packet-local
+timestamp disorder is handled explicitly by sensor-time bin assignment.
+
+For each complete half-open sensor-time interval `[start_us, end_us)`, both
+polarities increment a dense 320x320 count map. OpenCV contours are filtered by
+area and event count, and their center is weighted by per-pixel event count.
+The first selection uses highest event count; later selections prefer the
+previous/predicted position and enforce a maximum jump. Velocity is a
+least-squares line fit over a bounded detection history. Circularity is
+available but off by default because fast balls commonly form arcs. There is
+no Kalman filter.
+
+Outputs (only for valid detections) are:
+
+- `/openmv_cam/event_tracker/ball_2d_px` (`geometry_msgs/msg/PointStamped`)
+- `/openmv_cam/event_tracker/ball_velocity_px_s`
+  (`geometry_msgs/msg/Vector3Stamped`; z is scalar speed)
+- `/openmv_cam/event_tracker/valid` (`std_msgs/msg/Bool`)
+
+Coordinates are native OpenMV/GENX320 pixels: 320x320, top-left origin, x right,
+y down, and `frame_id=openmv_cam`. Tracker coordinates are never rotated.
+Message header stamps are the host ROS publication time. Sensor microseconds
+are used for binning and velocity only; they are not ROS epoch timestamps.
+
+The tracker defaults to disabled. Important parameters and defaults are:
+
+- `event_tracker_enabled=false`
+- `event_tracker_position_topic=/openmv_cam/event_tracker/ball_2d_px`
+- `event_tracker_velocity_topic=/openmv_cam/event_tracker/ball_velocity_px_s`
+- `event_tracker_valid_topic=/openmv_cam/event_tracker/valid`
+- `event_tracker_bin_ms=1.0`, `event_tracker_history_limit_ms=100.0`
+- `event_tracker_activity_threshold=1`
+- `event_tracker_min_event_count=3`
+- `event_tracker_min_blob_area_px=2`, `event_tracker_max_blob_area_px=500`
+- `event_tracker_morphology_kernel=0`,
+  `event_tracker_morphology_iterations=0`
+- `event_tracker_use_circularity=false`, `event_tracker_min_circularity=0.1`
+- `event_tracker_max_jump_px=100.0`
+- `event_tracker_velocity_history_size=5`
+- `event_tracker_velocity_min_span_ms=3.0`
+- `event_tracker_stats_period_sec=5.0`
+
+Example:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py event_tracker_enabled:=true
+```
+
+Optional latency traces use best-effort QoS on
+`/intercept_trace/event_2d_ball_detection` when
+`publish_latency_traces=true`. `input` traces correspond one-to-one with
+validated packets; `complete` traces correspond to every processed bin and
+carry packet lineage in `parent_sequence`. Both use stage
+`event_2d_ball_detection` and modality `event`. ROS timestamp fields contain
+host-clock values. GENX320 bin timestamps and finite detection/blob values are
+kept in `detail_json`. Consequently source-to-output latency begins when a
+complete EVT1 packet is available on the PC, not at physical sensor exposure.
+If `intercept_latency_monitor` is not installed, tracing logs an error and is
+disabled without stopping the reader. Configure with:
+
+- `publish_latency_traces=false`
+- `latency_trace_topic=/intercept_trace/event_2d_ball_detection`
+- `latency_trace_run_id=""`
+
 ## Native 1 ms activity voxel
 
 `/openmv_cam/event_voxel_1ms` is a `sensor_msgs/msg/Image` intended as the

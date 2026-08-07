@@ -46,14 +46,71 @@ The tracker defaults to disabled. Important parameters and defaults are:
   `event_tracker_morphology_iterations=0`
 - `event_tracker_use_circularity=false`, `event_tracker_min_circularity=0.1`
 - `event_tracker_max_jump_px=100.0`
+- `event_tracker_x_crop=[0, 320]`
 - `event_tracker_velocity_history_size=5`
 - `event_tracker_velocity_min_span_ms=3.0`
 - `event_tracker_stats_period_sec=5.0`
+- `event_tracker_debug_enabled=false`
+- `event_tracker_debug_topic=/openmv_cam/event_tracker/debug_image`
+- `event_tracker_debug_fps=10.0`
+- `event_tracker_debug_clip_count=16`
+- `event_tracker_debug_rotation_degrees=90`
+- `event_tracker_debug_activity_topic=/openmv_cam/event_tracker/debug/activity`
+- `event_tracker_debug_threshold_topic=/openmv_cam/event_tracker/debug/threshold`
+- `event_tracker_debug_contours_topic=/openmv_cam/event_tracker/debug/contours`
+- `event_tracker_debug_tracking_topic=/openmv_cam/event_tracker/debug/tracking`
+
+When enabled, the debug topic is a native-coordinate 320x320 `bgr8`
+`sensor_msgs/msg/Image`. A low-rate timer renders the latest cached complete-bin
+snapshot; annotation is never rendered in the serial reader. Activity uses the
+fixed mapping `round(255 * min(count, clip_count) / clip_count)` rather than
+per-image normalization. Non-selected candidates are orange, the selected
+contour and weighted COM are green, prediction is a yellow cross, recent COM
+history is a blue polyline, and valid velocity is a cyan arrow. Text identifies
+the sensor-time bin, event/candidate counts, validity, and velocity readiness.
+The graphical layer defaults to 90 degrees counterclockwise while the text is
+drawn afterward and remains upright. This affects only the debug image; tracker
+coordinates and numeric topics remain native and unrotated.
+
+Each new cached bin is rendered into synchronized, upright-text `bgr8` stage
+images at no more than `event_tracker_debug_fps`:
+
+- `debug/activity`: fixed-scale raw 1 ms activity map.
+- `debug/threshold`: binary mask passed to contour extraction.
+- `debug/contours`: filtered-in contours in red and rejected contours in orange.
+- `debug/tracking`: selection, COM, prediction, trajectory, and velocity.
+
+The original `/openmv_cam/event_tracker/debug_image` remains as a compatibility
+alias of `debug/tracking`.
+
+`event_tracker_x_crop` restricts detection to the native-coordinate half-open
+vertical corridor `[lower_x, upper_x)`. Events left or right of it never enter
+the activity map, contours, candidate selection, or velocity history. Both
+bounds are drawn as vertical magenta lines before debug-image rotation. With
+the default 90-degree counterclockwise rotation, they appear as the requested
+horizontal y corridor. Numeric outputs remain in native coordinates. Example:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py \
+  event_tracker_enabled:=true \
+  event_tracker_debug_enabled:=true \
+  event_tracker_x_crop:="[80, 240]"
+```
 
 Example:
 
 ```bash
 ros2 launch openmv_cam openmv.launch.py event_tracker_enabled:=true
+```
+
+Debug-view example:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py \
+  event_tracker_enabled:=true \
+  event_tracker_debug_enabled:=true \
+  event_tracker_debug_fps:=10.0 \
+  event_tracker_debug_clip_count:=16
 ```
 
 Optional latency traces use best-effort QoS on

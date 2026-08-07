@@ -2,7 +2,14 @@ import json
 
 import numpy as np
 
-from openmv_cam.event_ball_tracker import EventBallTracker, trace_detail_json
+from openmv_cam.event_ball_tracker import (
+    EventBallTracker,
+    TrackerDebugSnapshot,
+    TrackerDetection,
+    render_debug_image,
+    render_debug_images,
+    trace_detail_json,
+)
 from openmv_cam.evt1_protocol import EventPacket
 
 
@@ -41,6 +48,18 @@ def test_one_bin_activity_map_and_weighted_com():
     assert result.valid
     assert abs(result.x_px - (31 / 3)) < 1e-6
     assert result.y_px == 20
+
+
+def test_x_crop_uses_only_events_in_half_open_native_corridor():
+    subject = tracker(x_crop=(100, 200))
+    rows = [event(100, 99, 10), event(100, 100, 20),
+            event(100, 199, 30), event(100, 200, 40)]
+    activity = subject.build_activity_map(np.asarray(rows, dtype=np.uint16))
+    assert activity.sum() == 2
+    assert activity[20, 100] == 1
+    assert activity[30, 199] == 1
+    assert activity[10, 99] == 0
+    assert activity[40, 200] == 0
 
 
 def test_adjacent_bins_do_not_leak_and_empty_bins_are_safe():
@@ -107,3 +126,49 @@ def test_latency_detail_json_is_finite_and_keeps_sensor_time_out_of_ros_stamp():
     assert source.packet_ros_stamp_ns not in (detail["bin_start_us"], detail["bin_end_us"])
     assert all(np.isfinite(value) for value in detail.values()
                if isinstance(value, (int, float)) and not isinstance(value, bool))
+
+
+def test_debug_snapshot_is_cached_and_rendering_uses_fixed_scale():
+    subject = tracker()
+    subject.update(packet([event(100, 100, 200)]))
+    close_at(subject, 1000)
+    cached = subject.latest_debug_snapshot()
+    assert cached is not None
+    assert cached.activity.shape == (320, 320)
+    assert cached.detection.bin_start_us == 0
+
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[200, 200] = 1
+    activity[201, 200] = 16
+    selected = np.array([[[50, 50]], [[55, 50]], [[55, 55]], [[50, 55]]],
+                        dtype=np.int32)
+    rejected = selected + np.array([[[20, 0]]], dtype=np.int32)
+    detection = TrackerDetection(
+        10_000, 11_000, 1, 17, x_px=52.0, y_px=52.0,
+        vx_px_s=100.0, vy_px_s=0.0, speed_px_s=100.0,
+        valid=True, velocity_valid=True, candidate_count=2)
+    snapshot = TrackerDebugSnapshot(
+        activity, (activity > 0).astype(np.uint8) * 255, detection,
+        (selected, rejected), (selected,), selected, (40.0, 40.0),
+        ((45.0, 52.0), (52.0, 52.0)), (40, 280))
+    image = render_debug_image(snapshot, clip_count=16, rotation_degrees=0)
+    assert image.shape == (320, 320, 3)
+    assert image.dtype == np.uint8
+    assert image[200, 200].tolist() == [16, 16, 16]
+    assert image[201, 200].tolist() == [255, 255, 255]
+    assert image[50, 50].tolist() == [0, 255, 0]
+    assert image[50, 70].tolist() == [0, 128, 255]
+
+    rotated = render_debug_image(snapshot, clip_count=16, rotation_degrees=90)
+    # CCW mapping for a 320-square image: (y, x) -> (319-x, y).
+    assert rotated[119, 201].tolist() == [255, 255, 255]
+    # Native vertical x-crop bounds become horizontal after CCW rotation.
+    assert rotated[279, 300].tolist() == [255, 0, 255]
+
+    stages = render_debug_images(snapshot, clip_count=16, rotation_degrees=0)
+    assert set(stages) == {"activity", "threshold", "contours", "tracking"}
+    assert all(image.shape == (320, 320, 3) for image in stages.values())
+    assert stages["contours"][50, 50].tolist() == [0, 0, 255]
+    assert stages["contours"][50, 70].tolist() == [0, 128, 255]
+    assert stages["activity"][300, 40].tolist() == [255, 0, 255]
+    assert stages["threshold"][300, 279].tolist() == [255, 0, 255]

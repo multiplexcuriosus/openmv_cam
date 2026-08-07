@@ -2,6 +2,7 @@
 
 import json
 import math
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -34,6 +35,21 @@ class TrackerDetection:
     end_steady_ns: int = 0
 
 
+@dataclass(frozen=True)
+class TrackerDebugSnapshot:
+    """Immutable inputs needed to render one annotated debug image."""
+
+    activity: np.ndarray
+    threshold_mask: np.ndarray
+    detection: TrackerDetection
+    candidate_contours: tuple
+    accepted_candidate_contours: tuple
+    selected_contour: object
+    predicted_position: object
+    trajectory: tuple
+    x_crop: tuple
+
+
 class EventBallTracker:
     """Bin raw EVT1 events and select a simple activity blob."""
 
@@ -44,7 +60,7 @@ class EventBallTracker:
                  morphology_iterations=0, use_circularity=False,
                  min_circularity=0.1, max_jump_px=100.0,
                  velocity_history_size=5, velocity_min_span_ms=3.0,
-                 stats_history_size=512):
+                 stats_history_size=512, x_crop=None):
         self.width, self.height = int(width), int(height)
         self.bin_us = int(round(float(bin_ms) * 1000.0))
         if self.bin_us <= 0:
@@ -59,6 +75,14 @@ class EventBallTracker:
         self.use_circularity = bool(use_circularity)
         self.min_circularity = float(min_circularity)
         self.max_jump_px = float(max_jump_px)
+        if x_crop is None:
+            x_crop = (0, self.width)
+        if len(x_crop) != 2:
+            raise ValueError("x_crop must contain lower and upper bounds")
+        self.x_crop = (int(x_crop[0]), int(x_crop[1]))
+        if not 0 <= self.x_crop[0] < self.x_crop[1] <= self.width:
+            raise ValueError(
+                f"x_crop must satisfy 0 <= lower < upper <= {self.width}")
         self.velocity_min_span_us = float(velocity_min_span_ms) * 1000.0
         self.detections = deque(maxlen=max(2, int(velocity_history_size)))
         self._last_velocity = (0.0, 0.0)
@@ -74,6 +98,8 @@ class EventBallTracker:
             name: deque(maxlen=max(1, int(stats_history_size)))
             for name in timing_names}
         self.started_ns = time.monotonic_ns()
+        self._debug_lock = threading.Lock()
+        self._latest_debug_snapshot = None
 
     def build_activity_map(self, events):
         activity = np.zeros((self.height, self.width), dtype=np.uint16)
@@ -81,6 +107,7 @@ class EventBallTracker:
             events = np.asarray(events)
             x, y = events[:, 4].astype(np.int64), events[:, 5].astype(np.int64)
             valid = (x >= 0) & (x < self.width) & (y >= 0) & (y < self.height)
+            valid &= (x >= self.x_crop[0]) & (x < self.x_crop[1])
             np.add.at(activity, (y[valid], x[valid]), 1)
         return activity
 
@@ -117,18 +144,21 @@ class EventBallTracker:
             x, y, w, h = cv2.boundingRect(contour)
             result.append(dict(x=x_com, y=y_com, area=area, count=count,
                                bbox=(x, y, w, h), perimeter=perimeter,
-                               circularity=circularity))
-        return result
+                               circularity=circularity, contour=contour))
+        return result, contours, mask
 
-    def _select(self, candidates, timestamp_us):
-        if not candidates:
-            return None
+    def _predicted_position(self, timestamp_us):
         target = self.previous_position
         if len(self.detections) >= 2:
             t0, x0, y0 = self.detections[-1]
             dt = (timestamp_us - t0) / 1e6
             target = (x0 + self._last_velocity[0] * dt,
                       y0 + self._last_velocity[1] * dt)
+        return target
+
+    def _select(self, candidates, target):
+        if not candidates:
+            return None
         if target is None:
             return min(candidates, key=lambda c: (-c["count"], c["y"], c["x"]))
         ranked = sorted(candidates, key=lambda c: (
@@ -157,10 +187,11 @@ class EventBallTracker:
         activity = self.build_activity_map(events)
         self.timings["map_build"].append((time.monotonic_ns() - t) / 1e6)
         t = time.monotonic_ns()
-        candidates = self._candidates(activity)
+        candidates, threshold_contours, threshold_mask = self._candidates(activity)
         self.timings["blob_detection"].append((time.monotonic_ns() - t) / 1e6)
         self.counters["candidate_blob_count"] += len(candidates)
-        selected = self._select(candidates, start_us)
+        predicted_position = self._predicted_position(start_us)
+        selected = self._select(candidates, predicted_position)
         detection = TrackerDetection(start_us, start_us + self.bin_us, parent_id,
                                      int(activity.sum()), candidate_count=len(candidates),
                                      start_steady_ns=total_start)
@@ -187,8 +218,28 @@ class EventBallTracker:
         elapsed = (detection.end_steady_ns - total_start) / 1e6
         self.timings["computation"].append(elapsed)
         self.counters["processed_1ms_bins"] += 1
-        self.counters["empty_bins"] += int(not events)
+        self.counters["empty_bins"] += int(detection.event_count == 0)
+        snapshot = TrackerDebugSnapshot(
+            activity=activity.copy(), threshold_mask=threshold_mask.copy(),
+            detection=detection,
+            candidate_contours=tuple(
+                contour.copy() for contour in threshold_contours),
+            accepted_candidate_contours=tuple(
+                candidate["contour"].copy() for candidate in candidates),
+            selected_contour=(
+                selected["contour"].copy() if selected is not None else None),
+            predicted_position=predicted_position,
+            trajectory=tuple(
+                (float(x), float(y)) for _, x, y in self.detections),
+            x_crop=self.x_crop)
+        with self._debug_lock:
+            self._latest_debug_snapshot = snapshot
         return detection
+
+    def latest_debug_snapshot(self):
+        """Return the latest complete-bin snapshot, or None before the first bin."""
+        with self._debug_lock:
+            return self._latest_debug_snapshot
 
     def update(self, packet: EventPacket):
         update_start = time.monotonic_ns()
@@ -251,3 +302,103 @@ def trace_detail_json(detection: TrackerDetection) -> str:
               "candidate_count": detection.candidate_count,
               "velocity_valid": detection.velocity_valid}
     return json.dumps(detail, allow_nan=False, separators=(",", ":"))
+
+
+def _rotate_debug_layer(image, rotation_degrees):
+    """Rotate graphics while leaving text to be added by the caller."""
+    rotations = {
+        0: None,
+        90: cv2.ROTATE_90_COUNTERCLOCKWISE,
+        180: cv2.ROTATE_180,
+        -90: cv2.ROTATE_90_CLOCKWISE,
+    }
+    if rotation_degrees not in rotations:
+        raise ValueError("debug rotation must be one of -90, 0, 90, or 180")
+    return (cv2.rotate(image, rotations[rotation_degrees])
+            if rotations[rotation_degrees] is not None else image)
+
+
+def _debug_text(image, snapshot, stage):
+    """Add upright stage and tracker metadata."""
+    detection = snapshot.detection
+    line1 = (
+        f"{stage} bin [{detection.bin_start_us},{detection.bin_end_us}) us "
+        f"events={detection.event_count} candidates={detection.candidate_count}")
+    velocity = (
+        f"v=({detection.vx_px_s:.1f},{detection.vy_px_s:.1f}) px/s"
+        if detection.velocity_valid else "v=not ready")
+    line2 = (
+        f"valid={str(detection.valid).lower()} {velocity} "
+        f"x=[{snapshot.x_crop[0]},{snapshot.x_crop[1]})")
+    cv2.putText(image, line1, (4, 14), cv2.FONT_HERSHEY_SIMPLEX,
+                0.35, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(image, line2, (4, 29), cv2.FONT_HERSHEY_SIMPLEX,
+                0.35, (255, 255, 255), 1, cv2.LINE_AA)
+    return image
+
+
+def render_debug_images(snapshot: TrackerDebugSnapshot, clip_count=16,
+                        velocity_scale_s=0.02,
+                        rotation_degrees=90):
+    """Render synchronized BGR images for each tracker stage."""
+    clip_count = max(1, int(clip_count))
+    gray = np.rint(
+        np.minimum(snapshot.activity, clip_count) * (255.0 / clip_count)
+    ).astype(np.uint8)
+    activity = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    threshold = cv2.cvtColor(snapshot.threshold_mask, cv2.COLOR_GRAY2BGR)
+    contours = activity.copy()
+    tracking = activity.copy()
+
+    accepted_ids = {
+        contour.tobytes() for contour in snapshot.accepted_candidate_contours}
+    for contour in snapshot.candidate_contours:
+        color = (0, 0, 255) if contour.tobytes() in accepted_ids else (0, 128, 255)
+        cv2.drawContours(contours, [contour], -1, color, 1)
+
+    selected = snapshot.selected_contour
+    for contour in snapshot.candidate_contours:
+        if selected is not None and np.array_equal(contour, selected):
+            continue
+        cv2.drawContours(tracking, [contour], -1, (0, 128, 255), 1)
+    if selected is not None:
+        cv2.drawContours(tracking, [selected], -1, (0, 255, 0), 1)
+
+    detection = snapshot.detection
+    if snapshot.predicted_position is not None:
+        px, py = (int(round(value)) for value in snapshot.predicted_position)
+        cv2.drawMarker(tracking, (px, py), (0, 255, 255),
+                       cv2.MARKER_CROSS, 9, 1)
+    if len(snapshot.trajectory) >= 2:
+        points = np.rint(snapshot.trajectory).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(tracking, [points], False, (255, 0, 0), 1, cv2.LINE_AA)
+    if detection.valid:
+        center = (int(round(detection.x_px)), int(round(detection.y_px)))
+        cv2.circle(tracking, center, 3, (0, 255, 0), thickness=-1)
+        if detection.velocity_valid:
+            tip = (
+                int(round(detection.x_px + detection.vx_px_s * velocity_scale_s)),
+                int(round(detection.y_px + detection.vy_px_s * velocity_scale_s)))
+            cv2.arrowedLine(tracking, center, tip, (255, 255, 0), 1,
+                            cv2.LINE_AA, tipLength=0.25)
+
+    images = {"activity": activity, "threshold": threshold,
+              "contours": contours, "tracking": tracking}
+    lower_x, upper_x = snapshot.x_crop
+    for image in images.values():
+        cv2.line(image, (lower_x, 0), (lower_x, image.shape[0] - 1),
+                 (255, 0, 255), 1)
+        cv2.line(image, (upper_x - 1, 0),
+                 (upper_x - 1, image.shape[0] - 1), (255, 0, 255), 1)
+    return {
+        stage: _debug_text(
+            _rotate_debug_layer(image, rotation_degrees), snapshot, stage)
+        for stage, image in images.items()}
+
+
+def render_debug_image(snapshot: TrackerDebugSnapshot, clip_count=16,
+                       velocity_scale_s=0.02,
+                       rotation_degrees=90) -> np.ndarray:
+    """Render the backwards-compatible combined tracking debug image."""
+    return render_debug_images(
+        snapshot, clip_count, velocity_scale_s, rotation_degrees)["tracking"]

@@ -34,7 +34,11 @@ from .event_frame_contract import (
 from .event_diagnostics import EventDiagnosticCounters
 from .event_output_mode import resolve_event_outputs
 from .image_rotation import SUPPORTED_ROTATIONS_DEG, rotate_event_frame
-from .event_ball_tracker import EventBallTracker, trace_detail_json
+from .event_ball_tracker import (
+    EventBallTracker,
+    render_debug_images,
+    trace_detail_json,
+)
 from .evt1_protocol import EventPacket, MAX_EVENT_COUNT, reconstruct_timestamps_us
 
 
@@ -171,9 +175,29 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("event_tracker_use_circularity", False)
         self.declare_parameter("event_tracker_min_circularity", 0.1)
         self.declare_parameter("event_tracker_max_jump_px", 100.0)
+        self.declare_parameter("event_tracker_x_crop", [0, 320])
         self.declare_parameter("event_tracker_velocity_history_size", 5)
         self.declare_parameter("event_tracker_velocity_min_span_ms", 3.0)
         self.declare_parameter("event_tracker_stats_period_sec", 5.0)
+        self.declare_parameter("event_tracker_debug_enabled", False)
+        self.declare_parameter(
+            "event_tracker_debug_topic",
+            "/openmv_cam/event_tracker/debug_image")
+        self.declare_parameter("event_tracker_debug_fps", 10.0)
+        self.declare_parameter("event_tracker_debug_clip_count", 16)
+        self.declare_parameter("event_tracker_debug_rotation_degrees", 90)
+        self.declare_parameter(
+            "event_tracker_debug_activity_topic",
+            "/openmv_cam/event_tracker/debug/activity")
+        self.declare_parameter(
+            "event_tracker_debug_threshold_topic",
+            "/openmv_cam/event_tracker/debug/threshold")
+        self.declare_parameter(
+            "event_tracker_debug_contours_topic",
+            "/openmv_cam/event_tracker/debug/contours")
+        self.declare_parameter(
+            "event_tracker_debug_tracking_topic",
+            "/openmv_cam/event_tracker/debug/tracking")
         self.declare_parameter("publish_latency_traces", False)
         self.declare_parameter(
             "latency_trace_topic",
@@ -270,6 +294,10 @@ class OpenMVEventCamNode(Node):
         self.event_tracker_position_pub = None
         self.event_tracker_velocity_pub = None
         self.event_tracker_valid_pub = None
+        self.event_tracker_debug_pub = None
+        self.event_tracker_debug_stage_pubs = {}
+        self.event_tracker_debug_timer = None
+        self._last_tracker_debug_bin_start_us = None
         self.latency_trace_pub = None
         self.LatencyTrace = None
         self._tracker_trace_sequence = 0
@@ -297,6 +325,7 @@ class OpenMVEventCamNode(Node):
                     self.get_parameter("event_tracker_min_circularity").value),
                 max_jump_px=float(
                     self.get_parameter("event_tracker_max_jump_px").value),
+                x_crop=list(self.get_parameter("event_tracker_x_crop").value),
                 velocity_history_size=int(self.get_parameter(
                     "event_tracker_velocity_history_size").value),
                 velocity_min_span_ms=float(self.get_parameter(
@@ -315,6 +344,28 @@ class OpenMVEventCamNode(Node):
                 10)
             self.event_tracker_stats_timer = self.create_timer(
                 self.event_tracker_stats_period_sec, self._event_tracker_stats_cb)
+            if bool(self.get_parameter("event_tracker_debug_enabled").value):
+                debug_fps = float(
+                    self.get_parameter("event_tracker_debug_fps").value)
+                if not np.isfinite(debug_fps) or debug_fps <= 0.0:
+                    raise ValueError(
+                        "event_tracker_debug_fps must be positive and finite")
+                self.event_tracker_debug_pub = self.create_publisher(
+                    Image,
+                    str(self.get_parameter("event_tracker_debug_topic").value),
+                    10)
+                stage_topic_parameters = {
+                    "activity": "event_tracker_debug_activity_topic",
+                    "threshold": "event_tracker_debug_threshold_topic",
+                    "contours": "event_tracker_debug_contours_topic",
+                    "tracking": "event_tracker_debug_tracking_topic",
+                }
+                self.event_tracker_debug_stage_pubs = {
+                    stage: self.create_publisher(
+                        Image, str(self.get_parameter(parameter).value), 10)
+                    for stage, parameter in stage_topic_parameters.items()}
+                self.event_tracker_debug_timer = self.create_timer(
+                    1.0 / debug_fps, self._event_tracker_debug_timer_cb)
             if bool(self.get_parameter("publish_latency_traces").value):
                 try:
                     from intercept_latency_monitor.msg import LatencyTrace
@@ -1319,6 +1370,32 @@ class OpenMVEventCamNode(Node):
             f" position_output_rate_hz={stats['position_output_rate_hz']:.2f}"
             f" detection_rate_hz={stats['detection_rate_hz']:.2f} " + timings)
 
+    def _event_tracker_debug_timer_cb(self):
+        snapshot = self.event_tracker.latest_debug_snapshot()
+        if snapshot is None:
+            return
+        bin_start_us = snapshot.detection.bin_start_us
+        if bin_start_us == self._last_tracker_debug_bin_start_us:
+            return
+        self._last_tracker_debug_bin_start_us = bin_start_us
+        images = render_debug_images(
+            snapshot,
+            clip_count=int(
+                self.get_parameter("event_tracker_debug_clip_count").value),
+            rotation_degrees=int(self.get_parameter(
+                "event_tracker_debug_rotation_degrees").value))
+        stamp = self.get_clock().now().to_msg()
+        for stage, image in images.items():
+            message = self.bridge.cv2_to_imgmsg(image, encoding="bgr8")
+            message.header.stamp = stamp
+            message.header.frame_id = "openmv_cam"
+            self.event_tracker_debug_stage_pubs[stage].publish(message)
+        # Preserve the original combined topic as an alias of the tracking stage.
+        combined = self.bridge.cv2_to_imgmsg(images["tracking"], encoding="bgr8")
+        combined.header.stamp = stamp
+        combined.header.frame_id = "openmv_cam"
+        self.event_tracker_debug_pub.publish(combined)
+
     def _reader_loop(self):
         while not self._stop_event.is_set():
             try:
@@ -1725,6 +1802,10 @@ class OpenMVEventCamNode(Node):
             self.event_tracker_stats_timer.cancel()
             self.destroy_timer(self.event_tracker_stats_timer)
             self.event_tracker_stats_timer = None
+        if self.event_tracker_debug_timer is not None:
+            self.event_tracker_debug_timer.cancel()
+            self.destroy_timer(self.event_tracker_debug_timer)
+            self.event_tracker_debug_timer = None
 
         with self._preview_lock:
             self.preview_buffer.clear()

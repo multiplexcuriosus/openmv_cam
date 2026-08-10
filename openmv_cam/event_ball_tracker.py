@@ -72,6 +72,8 @@ class EventBallTracker:
                  max_blob_area_px=2000, min_blob_width_px=1,
                  max_blob_width_px=320, min_blob_height_px=1,
                  max_blob_height_px=320, activity_threshold=1,
+                 spatial_filter_enabled=False,
+                 spatial_filter_min_neighbors=1,
                  morphology_operation="close", morphology_kernel=3,
                  morphology_iterations=1, use_circularity=False,
                  min_circularity=0.1, max_jump_px=100.0,
@@ -97,6 +99,12 @@ class EventBallTracker:
         self.min_blob_height_px = int(min_blob_height_px)
         self.max_blob_height_px = int(max_blob_height_px)
         self.activity_threshold = max(1, int(activity_threshold))
+        self.spatial_filter_enabled = bool(spatial_filter_enabled)
+        self.spatial_filter_min_neighbors = int(
+            spatial_filter_min_neighbors)
+        if not 0 <= self.spatial_filter_min_neighbors <= 8:
+            raise ValueError(
+                "spatial_filter_min_neighbors must be between 0 and 8")
         operation = str(morphology_operation).strip().lower()
         if operation not in self.MORPHOLOGY_OPERATIONS:
             raise ValueError(
@@ -195,11 +203,28 @@ class EventBallTracker:
                 (y >= lower_y) & (y < upper_y))
 
     def _grouping_mask(self, activity):
-        mask = (activity >= self.activity_threshold).astype(np.uint8) * 255
+        crop_mask = self._crop_mask().astype(np.uint8)
+        foreground = (activity >= self.activity_threshold).astype(np.uint8)
+        foreground *= crop_mask
+        threshold_count = int(cv2.countNonZero(foreground))
+        self.counters["threshold_foreground_pixels"] += threshold_count
+
+        if self.spatial_filter_enabled:
+            neighbor_kernel = np.ones((3, 3), dtype=np.uint8)
+            neighbor_kernel[1, 1] = 0
+            neighbor_count = cv2.filter2D(
+                foreground, cv2.CV_16U, neighbor_kernel,
+                borderType=cv2.BORDER_CONSTANT)
+            foreground[neighbor_count <
+                       self.spatial_filter_min_neighbors] = 0
+            self.counters["spatial_filter_removed_pixels"] += (
+                threshold_count - int(cv2.countNonZero(foreground)))
+
+        mask = foreground * 255
         if (self.morphology_operation == "none" or
                 self.morphology_kernel <= 0 or
                 self.morphology_iterations <= 0):
-            return mask * self._crop_mask().astype(np.uint8)
+            return mask
         kernel = np.ones(
             (self.morphology_kernel, self.morphology_kernel), np.uint8)
         if self.morphology_operation == "close":
@@ -210,7 +235,7 @@ class EventBallTracker:
             # Explicit dilation is the only other allowed grouping operation.
             grouped = cv2.dilate(
                 mask, kernel, iterations=self.morphology_iterations)
-        return grouped * self._crop_mask().astype(np.uint8)
+        return grouped * crop_mask
 
     def _candidate_rejection_reason(self, candidate):
         if candidate["area"] < self.min_blob_area_px:

@@ -108,6 +108,67 @@ def test_morphological_opening_is_never_used(monkeypatch):
     assert operations == [cv2.MORPH_CLOSE]
 
 
+def test_spatial_filter_removes_one_isolated_pixel():
+    subject = tracker(spatial_filter_enabled=True,
+                      spatial_filter_min_neighbors=1)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 10] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 0
+    assert subject.counters["threshold_foreground_pixels"] == 1
+    assert subject.counters["spatial_filter_removed_pixels"] == 1
+
+
+def test_spatial_filter_retains_two_adjacent_pixels():
+    subject = tracker(spatial_filter_enabled=True,
+                      spatial_filter_min_neighbors=1)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 10:12] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 2
+
+
+def test_spatial_filter_counts_diagonal_neighbors():
+    subject = tracker(spatial_filter_enabled=True,
+                      spatial_filter_min_neighbors=1)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 10] = 1
+    activity[21, 11] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 2
+
+
+def test_spatial_filter_crop_boundary_excludes_outside_support():
+    subject = tracker(x_crop=(10, 20), spatial_filter_enabled=True,
+                      spatial_filter_min_neighbors=1)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 9:11] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 0
+
+
+def test_disabled_spatial_filter_preserves_isolated_foreground():
+    subject = tracker(spatial_filter_enabled=False,
+                      spatial_filter_min_neighbors=1)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 10] = 1
+    assert subject._grouping_mask(activity)[20, 10] == 255
+    assert subject.counters["spatial_filter_removed_pixels"] == 0
+
+
+def test_spatial_filter_does_not_modify_activity_or_raw_com_inputs():
+    subject = tracker(x_crop=(0, 300), spatial_filter_enabled=True,
+                      spatial_filter_min_neighbors=1)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[40, 10] = 2
+    activity[40, 11] = 1
+    activity[100, 100] = 1
+    original = activity.copy()
+    candidates, _, grouping_mask = subject._candidates(activity, None)
+    assert np.array_equal(activity, original)
+    assert grouping_mask[100, 100] == 0
+    assert len(candidates) == 1
+    assert candidates[0]["raw_event_count"] == 3
+    assert candidates[0]["x"] == pytest.approx(31.0 / 3.0)
+    assert candidates[0]["y"] == 40.0
+
+
 def test_dilation_groups_but_cannot_bias_raw_event_com():
     subject = tracker(x_crop=(0, 300), morphology_operation="dilate",
                       morphology_kernel=5, morphology_iterations=1)

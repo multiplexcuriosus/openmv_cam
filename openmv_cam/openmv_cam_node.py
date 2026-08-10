@@ -177,6 +177,9 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("event_tracker_accumulation_window_ms", 10.0)
         self.declare_parameter("event_tracker_history_limit_ms", 100.0)
         self.declare_parameter("event_tracker_activity_threshold", 1)
+        self.declare_parameter("event_tracker_spatial_filter_enabled", False)
+        self.declare_parameter(
+            "event_tracker_spatial_filter_min_neighbors", 1)
         self.declare_parameter("event_tracker_min_event_count", 3)
         self.declare_parameter("event_tracker_min_blob_area_px", 2)
         self.declare_parameter("event_tracker_max_blob_area_px", 2000)
@@ -328,6 +331,10 @@ class OpenMVEventCamNode(Node):
                     self.get_parameter("event_tracker_history_limit_ms").value),
                 activity_threshold=int(
                     self.get_parameter("event_tracker_activity_threshold").value),
+                spatial_filter_enabled=bool(self.get_parameter(
+                    "event_tracker_spatial_filter_enabled").value),
+                spatial_filter_min_neighbors=int(self.get_parameter(
+                    "event_tracker_spatial_filter_min_neighbors").value),
                 min_event_count=int(
                     self.get_parameter("event_tracker_min_event_count").value),
                 min_blob_area_px=int(
@@ -1454,7 +1461,8 @@ class OpenMVEventCamNode(Node):
                 "processed_1ms_bins", "window_updates", "empty_bins",
                 "late_events_or_bins", "candidate_blob_count",
                 "valid_detections", "invalid_detections",
-                "velocity_ready_count")
+                "velocity_ready_count", "threshold_foreground_pixels",
+                "spatial_filter_removed_pixels")
         counts = " ".join(f"{key}={stats.get(key, 0)}" for key in keys)
         self.get_logger().info(
             "EVENT TRACKER STATS | " + counts +

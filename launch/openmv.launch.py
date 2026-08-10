@@ -130,6 +130,8 @@ def generate_launch_description():
         "event_tracker_accumulation_window_ms": "10.0",
         "event_tracker_history_limit_ms": "100.0",
         "event_tracker_activity_threshold": "1",
+        "event_tracker_spatial_filter_enabled": "false",
+        "event_tracker_spatial_filter_min_neighbors": "1",
         "event_tracker_min_event_count": "3",
         "event_tracker_min_blob_area_px": "2",
         "event_tracker_max_blob_area_px": "2000",

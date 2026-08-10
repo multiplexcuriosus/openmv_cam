@@ -137,7 +137,9 @@ the EVT1 packet rate (typically 50-70 Hz), not the approximately 1 kHz internal
 bin rate.
 
 The grouping mask supports only `none`, `close`, and `dilate`; morphological
-opening is never used. Closing or dilation may connect sparse elongated trails,
+opening is never used. When enabled, spatial filtering applies the crop, the
+optional 8-neighbor cutoff, and an 8-connected component-area cutoff before
+morphology. Closing or dilation may connect sparse elongated trails,
 but generated pixels are used only for grouping. Candidate event count and COM
 always come from original raw activity inside the filled grouping contour.
 Candidates are constrained by raw event count, fill area, width, and height.
@@ -171,6 +173,9 @@ The tracker defaults to disabled. Important parameters and defaults are:
 - `event_tracker_accumulation_window_ms=10.0`
 - `event_tracker_history_limit_ms=100.0`
 - `event_tracker_activity_threshold=1`
+- `event_tracker_spatial_filter_enabled=false`
+- `event_tracker_spatial_filter_min_neighbors=1`
+- `event_tracker_spatial_filter_min_component_area_px=1`
 - `event_tracker_min_event_count=3`
 - `event_tracker_min_blob_area_px=2`, `event_tracker_max_blob_area_px=2000`
 - `event_tracker_min_blob_width_px=1`, `event_tracker_max_blob_width_px=320`
@@ -188,6 +193,19 @@ The tracker defaults to disabled. Important parameters and defaults are:
 - `event_tracker_stats_period_sec=5.0`
 - `event_tracker_debug_enabled=false`
 - `event_tracker_debug_topic=/openmv_cam/event_tracker/debug_image`
+
+For example, remove components smaller than four foreground pixels before one
+iteration of 3x3 dilation:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py \
+  event_tracker_spatial_filter_enabled:=true \
+  event_tracker_spatial_filter_min_neighbors:=1 \
+  event_tracker_spatial_filter_min_component_area_px:=4 \
+  event_tracker_morphology_operation:=dilate \
+  event_tracker_morphology_kernel:=3 \
+  event_tracker_morphology_iterations:=1
+```
 - `event_tracker_debug_fps=10.0`
 - `event_tracker_debug_clip_count=16`
 - `event_tracker_debug_rotation_degrees=90`

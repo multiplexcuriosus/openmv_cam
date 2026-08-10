@@ -59,6 +59,7 @@ class TrackerDebugSnapshot:
     x_crop: tuple
     y_crop: tuple = ()
     candidate_details: tuple = ()
+    removed_component_contours: tuple = ()
 
 
 class EventBallTracker:
@@ -74,6 +75,7 @@ class EventBallTracker:
                  max_blob_height_px=320, activity_threshold=1,
                  spatial_filter_enabled=False,
                  spatial_filter_min_neighbors=1,
+                 spatial_filter_min_component_area_px=1,
                  morphology_operation="close", morphology_kernel=3,
                  morphology_iterations=1, use_circularity=False,
                  min_circularity=0.1, max_jump_px=100.0,
@@ -105,6 +107,11 @@ class EventBallTracker:
         if not 0 <= self.spatial_filter_min_neighbors <= 8:
             raise ValueError(
                 "spatial_filter_min_neighbors must be between 0 and 8")
+        self.spatial_filter_min_component_area_px = int(
+            spatial_filter_min_component_area_px)
+        if self.spatial_filter_min_component_area_px < 1:
+            raise ValueError(
+                "spatial_filter_min_component_area_px must be positive")
         operation = str(morphology_operation).strip().lower()
         if operation not in self.MORPHOLOGY_OPERATIONS:
             raise ValueError(
@@ -164,6 +171,7 @@ class EventBallTracker:
         self.started_ns = time.monotonic_ns()
         self._debug_lock = threading.Lock()
         self._latest_debug_snapshot = None
+        self._last_removed_component_contours = ()
 
     def _valid_event_coordinates(self, events):
         x = events[:, 4].astype(np.int64)
@@ -203,6 +211,7 @@ class EventBallTracker:
                 (y >= lower_y) & (y < upper_y))
 
     def _grouping_mask(self, activity):
+        self._last_removed_component_contours = ()
         crop_mask = self._crop_mask().astype(np.uint8)
         foreground = (activity >= self.activity_threshold).astype(np.uint8)
         foreground *= crop_mask
@@ -219,6 +228,30 @@ class EventBallTracker:
                        self.spatial_filter_min_neighbors] = 0
             self.counters["spatial_filter_removed_pixels"] += (
                 threshold_count - int(cv2.countNonZero(foreground)))
+
+            component_count, labels, stats, _ = (
+                cv2.connectedComponentsWithStats(
+                    foreground, connectivity=8))
+            removed_labels = [
+                label for label in range(1, component_count)
+                if stats[label, cv2.CC_STAT_AREA] <
+                self.spatial_filter_min_component_area_px
+            ]
+            if removed_labels:
+                removed_mask = np.isin(labels, removed_labels).astype(
+                    np.uint8)
+                removed_pixels = int(cv2.countNonZero(removed_mask))
+                foreground[removed_mask != 0] = 0
+                removed_contours, _ = cv2.findContours(
+                    removed_mask * 255, cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE)
+                self._last_removed_component_contours = tuple(
+                    contour.copy() for contour in removed_contours)
+                self.counters["spatial_filter_removed_components"] += len(
+                    removed_labels)
+                self.counters[
+                    "spatial_filter_removed_component_pixels"] += (
+                        removed_pixels)
 
         mask = foreground * 255
         if (self.morphology_operation == "none" or
@@ -478,7 +511,10 @@ class EventBallTracker:
             trajectory=tuple(
                 (float(x), float(y)) for _, x, y in self.detections),
             x_crop=self.x_crop, y_crop=self.y_crop,
-            candidate_details=details)
+            candidate_details=details,
+            removed_component_contours=tuple(
+                contour.copy() for contour in
+                self._last_removed_component_contours))
         with self._debug_lock:
             self._latest_debug_snapshot = snapshot
         return detection
@@ -606,6 +642,12 @@ def _debug_text(image, snapshot, stage):
                 0.33, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(image, line2, (4, 29), cv2.FONT_HERSHEY_SIMPLEX,
                 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+    if stage in ("contours", "tracking"):
+        cv2.putText(
+            image,
+            "cyan=component removed orange=not selected green=selected",
+            (4, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.30,
+            (255, 255, 255), 1, cv2.LINE_AA)
     return image
 
 
@@ -621,6 +663,10 @@ def render_debug_images(snapshot: TrackerDebugSnapshot, clip_count=16,
     threshold = cv2.cvtColor(snapshot.threshold_mask, cv2.COLOR_GRAY2BGR)
     contours = activity.copy()
     tracking = activity.copy()
+
+    for removed in snapshot.removed_component_contours:
+        cv2.drawContours(contours, [removed], -1, (255, 255, 0), 1)
+        cv2.drawContours(tracking, [removed], -1, (255, 255, 0), 1)
 
     accepted_ids = {
         contour.tobytes() for contour in snapshot.accepted_candidate_contours}

@@ -169,6 +169,111 @@ def test_spatial_filter_does_not_modify_activity_or_raw_com_inputs():
     assert candidates[0]["y"] == 40.0
 
 
+def test_component_filter_removes_one_pixel_before_dilation():
+    subject = tracker(
+        spatial_filter_enabled=True, spatial_filter_min_neighbors=0,
+        spatial_filter_min_component_area_px=2,
+        morphology_operation="dilate", morphology_kernel=3,
+        morphology_iterations=1)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 10] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 0
+    assert subject.counters["spatial_filter_removed_components"] == 1
+    assert subject.counters["spatial_filter_removed_component_pixels"] == 1
+
+
+def test_component_filter_removes_small_two_by_two_component():
+    subject = tracker(
+        spatial_filter_enabled=True, spatial_filter_min_neighbors=0,
+        spatial_filter_min_component_area_px=5)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20:22, 10:12] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 0
+    assert subject.counters["spatial_filter_removed_components"] == 1
+    assert subject.counters["spatial_filter_removed_component_pixels"] == 4
+
+
+def test_component_filter_retains_component_at_area_cutoff():
+    subject = tracker(
+        spatial_filter_enabled=True, spatial_filter_min_neighbors=0,
+        spatial_filter_min_component_area_px=4)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20:22, 10:12] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 4
+
+
+def test_component_filter_uses_diagonal_eight_connectivity():
+    subject = tracker(
+        spatial_filter_enabled=True, spatial_filter_min_neighbors=0,
+        spatial_filter_min_component_area_px=2)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 10] = 1
+    activity[21, 11] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 2
+
+
+def test_component_filter_crop_boundary_excludes_outside_pixels():
+    subject = tracker(
+        x_crop=(10, 20), spatial_filter_enabled=True,
+        spatial_filter_min_neighbors=0,
+        spatial_filter_min_component_area_px=2)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 9:11] = 1
+    assert cv2.countNonZero(subject._grouping_mask(activity)) == 0
+
+
+def test_disabled_component_filter_preserves_small_component():
+    subject = tracker(
+        spatial_filter_enabled=False,
+        spatial_filter_min_component_area_px=10)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[20, 10] = 1
+    assert subject._grouping_mask(activity)[20, 10] == 255
+    assert subject.counters["spatial_filter_removed_components"] == 0
+
+
+def test_component_filter_preserves_activity_and_raw_com():
+    subject = tracker(
+        x_crop=(0, 300), spatial_filter_enabled=True,
+        spatial_filter_min_neighbors=0,
+        spatial_filter_min_component_area_px=2)
+    activity = np.zeros((320, 320), dtype=np.uint16)
+    activity[40, 10] = 2
+    activity[40, 11] = 1
+    activity[100, 100] = 7
+    original = activity.copy()
+    candidates, _, grouping_mask = subject._candidates(activity, None)
+    assert np.array_equal(activity, original)
+    assert grouping_mask[100, 100] == 0
+    assert len(candidates) == 1
+    assert candidates[0]["raw_event_count"] == 3
+    assert candidates[0]["x"] == pytest.approx(31.0 / 3.0)
+    assert candidates[0]["y"] == 40.0
+
+
+def test_debug_distinguishes_removed_rejected_and_selected_contours():
+    removed = np.asarray([[[20, 80]]], dtype=np.int32)
+    rejected = np.asarray([[[30, 90]]], dtype=np.int32)
+    selected = np.asarray([[[40, 100]]], dtype=np.int32)
+    detection = TrackerDetection(0, 1000, 1, 0)
+    snapshot = TrackerDebugSnapshot(
+        activity=np.zeros((320, 320), dtype=np.uint16),
+        threshold_mask=np.zeros((320, 320), dtype=np.uint8),
+        detection=detection,
+        candidate_contours=(rejected, selected),
+        accepted_candidate_contours=(selected,),
+        selected_contour=selected,
+        predicted_position=None,
+        trajectory=(),
+        x_crop=(0, 320),
+        removed_component_contours=(removed,))
+    tracking = render_debug_images(
+        snapshot, rotation_degrees=0)["tracking"]
+    assert tracking[80, 20].tolist() == [255, 255, 0]
+    assert tracking[90, 30].tolist() == [0, 128, 255]
+    assert tracking[100, 40].tolist() == [0, 255, 0]
+
+
 def test_dilation_groups_but_cannot_bias_raw_event_com():
     subject = tracker(x_crop=(0, 300), morphology_operation="dilate",
                       morphology_kernel=5, morphology_iterations=1)

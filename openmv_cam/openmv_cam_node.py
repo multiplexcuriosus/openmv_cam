@@ -165,17 +165,25 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter(
             "event_tracker_valid_topic", "/openmv_cam/event_tracker/valid")
         self.declare_parameter("event_tracker_bin_ms", 1.0)
+        self.declare_parameter("event_tracker_accumulation_window_ms", 10.0)
         self.declare_parameter("event_tracker_history_limit_ms", 100.0)
         self.declare_parameter("event_tracker_activity_threshold", 1)
         self.declare_parameter("event_tracker_min_event_count", 3)
         self.declare_parameter("event_tracker_min_blob_area_px", 2)
-        self.declare_parameter("event_tracker_max_blob_area_px", 500)
-        self.declare_parameter("event_tracker_morphology_kernel", 0)
-        self.declare_parameter("event_tracker_morphology_iterations", 0)
+        self.declare_parameter("event_tracker_max_blob_area_px", 2000)
+        self.declare_parameter("event_tracker_min_blob_width_px", 1)
+        self.declare_parameter("event_tracker_max_blob_width_px", 320)
+        self.declare_parameter("event_tracker_min_blob_height_px", 1)
+        self.declare_parameter("event_tracker_max_blob_height_px", 320)
+        self.declare_parameter("event_tracker_morphology_operation", "close")
+        self.declare_parameter("event_tracker_morphology_kernel", 3)
+        self.declare_parameter("event_tracker_morphology_iterations", 1)
         self.declare_parameter("event_tracker_use_circularity", False)
         self.declare_parameter("event_tracker_min_circularity", 0.1)
         self.declare_parameter("event_tracker_max_jump_px", 100.0)
-        self.declare_parameter("event_tracker_x_crop", [0, 320])
+        self.declare_parameter("event_tracker_reacquire_after_misses", 3)
+        self.declare_parameter("event_tracker_x_crop", [80, 215])
+        self.declare_parameter("event_tracker_y_crop", [35, 275, 85, 235])
         self.declare_parameter("event_tracker_velocity_history_size", 5)
         self.declare_parameter("event_tracker_velocity_min_span_ms", 3.0)
         self.declare_parameter("event_tracker_stats_period_sec", 5.0)
@@ -305,6 +313,8 @@ class OpenMVEventCamNode(Node):
             self.event_tracker = EventBallTracker(
                 width=self.W, height=self.H,
                 bin_ms=float(self.get_parameter("event_tracker_bin_ms").value),
+                accumulation_window_ms=float(self.get_parameter(
+                    "event_tracker_accumulation_window_ms").value),
                 history_limit_ms=float(
                     self.get_parameter("event_tracker_history_limit_ms").value),
                 activity_threshold=int(
@@ -315,6 +325,16 @@ class OpenMVEventCamNode(Node):
                     self.get_parameter("event_tracker_min_blob_area_px").value),
                 max_blob_area_px=int(
                     self.get_parameter("event_tracker_max_blob_area_px").value),
+                min_blob_width_px=int(
+                    self.get_parameter("event_tracker_min_blob_width_px").value),
+                max_blob_width_px=int(
+                    self.get_parameter("event_tracker_max_blob_width_px").value),
+                min_blob_height_px=int(self.get_parameter(
+                    "event_tracker_min_blob_height_px").value),
+                max_blob_height_px=int(self.get_parameter(
+                    "event_tracker_max_blob_height_px").value),
+                morphology_operation=str(self.get_parameter(
+                    "event_tracker_morphology_operation").value),
                 morphology_kernel=int(
                     self.get_parameter("event_tracker_morphology_kernel").value),
                 morphology_iterations=int(self.get_parameter(
@@ -325,7 +345,10 @@ class OpenMVEventCamNode(Node):
                     self.get_parameter("event_tracker_min_circularity").value),
                 max_jump_px=float(
                     self.get_parameter("event_tracker_max_jump_px").value),
+                reacquire_after_misses=int(self.get_parameter(
+                    "event_tracker_reacquire_after_misses").value),
                 x_crop=list(self.get_parameter("event_tracker_x_crop").value),
+                y_crop=list(self.get_parameter("event_tracker_y_crop").value),
                 velocity_history_size=int(self.get_parameter(
                     "event_tracker_velocity_history_size").value),
                 velocity_min_span_ms=float(self.get_parameter(
@@ -1360,24 +1383,28 @@ class OpenMVEventCamNode(Node):
         timings = " ".join(
             f"{name}_p50/p95/max_ms={stats[name][0]:.3f}/{stats[name][1]:.3f}/{stats[name][2]:.3f}"
             for name in timing_names)
-        keys = ("packets_received", "packets_with_events", "processed_1ms_bins",
-                "empty_bins", "late_events_or_bins", "candidate_blob_count",
-                "valid_detections", "invalid_detections", "velocity_ready_count")
+        keys = ("packets_received", "packets_with_events",
+                "processed_1ms_bins", "window_updates", "empty_bins",
+                "late_events_or_bins", "candidate_blob_count",
+                "valid_detections", "invalid_detections",
+                "velocity_ready_count")
         counts = " ".join(f"{key}={stats.get(key, 0)}" for key in keys)
         self.get_logger().info(
             "EVENT TRACKER STATS | " + counts +
             f" event_rate_hz={stats['event_rate_hz']:.1f}"
-            f" position_output_rate_hz={stats['position_output_rate_hz']:.2f}"
-            f" detection_rate_hz={stats['detection_rate_hz']:.2f} " + timings)
+            f" processed_bin_rate_hz={stats['processed_bin_rate_hz']:.2f}"
+            f" window_update_rate_hz={stats['window_update_rate_hz']:.2f}"
+            f" valid_detection_rate_hz="
+            f"{stats['valid_detection_rate_hz']:.2f} " + timings)
 
     def _event_tracker_debug_timer_cb(self):
         snapshot = self.event_tracker.latest_debug_snapshot()
         if snapshot is None:
             return
-        bin_start_us = snapshot.detection.bin_start_us
-        if bin_start_us == self._last_tracker_debug_bin_start_us:
+        window_end_us = snapshot.detection.window_end_us
+        if window_end_us == self._last_tracker_debug_bin_start_us:
             return
-        self._last_tracker_debug_bin_start_us = bin_start_us
+        self._last_tracker_debug_bin_start_us = window_end_us
         images = render_debug_images(
             snapshot,
             clip_count=int(

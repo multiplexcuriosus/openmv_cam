@@ -1,4 +1,4 @@
-"""Small ROS-independent event-time ball tracker."""
+"""ROS-independent sliding-window event ball tracker."""
 
 import json
 import math
@@ -15,10 +15,15 @@ from .evt1_protocol import EventPacket
 
 @dataclass
 class TrackerDetection:
+    """Result of one packet-rate sliding-window tracker update."""
+
     bin_start_us: int
     bin_end_us: int
     parent_packet_id: int
     event_count: int
+    window_start_us: int = 0
+    window_end_us: int = 0
+    window_event_count: int = 0
     x_px: float = 0.0
     y_px: float = 0.0
     vx_px_s: float = 0.0
@@ -29,15 +34,19 @@ class TrackerDetection:
     velocity_valid: bool = False
     blob_area_px: int = 0
     blob_event_count: int = 0
+    blob_width_px: int = 0
+    blob_height_px: int = 0
+    blob_perimeter_px: float = 0.0
     circularity: float = 0.0
     candidate_count: int = 0
+    rejection_reason: str = ""
     start_steady_ns: int = 0
     end_steady_ns: int = 0
 
 
 @dataclass(frozen=True)
 class TrackerDebugSnapshot:
-    """Immutable inputs needed to render one annotated debug image."""
+    """Immutable inputs needed to render synchronized debug images."""
 
     activity: np.ndarray
     threshold_mask: np.ndarray
@@ -48,33 +57,59 @@ class TrackerDebugSnapshot:
     predicted_position: object
     trajectory: tuple
     x_crop: tuple
+    y_crop: tuple = ()
+    candidate_details: tuple = ()
 
 
 class EventBallTracker:
-    """Bin raw EVT1 events and select a simple activity blob."""
+    """Track raw event activity using one sliding-window update per packet."""
+
+    MORPHOLOGY_OPERATIONS = ("none", "close", "dilate")
 
     def __init__(self, *, width=320, height=320, bin_ms=1.0,
-                 history_limit_ms=100.0, min_event_count=3,
-                 min_blob_area_px=2, max_blob_area_px=500,
-                 activity_threshold=1, morphology_kernel=0,
-                 morphology_iterations=0, use_circularity=False,
+                 accumulation_window_ms=10.0, history_limit_ms=100.0,
+                 min_event_count=3, min_blob_area_px=2,
+                 max_blob_area_px=2000, min_blob_width_px=1,
+                 max_blob_width_px=320, min_blob_height_px=1,
+                 max_blob_height_px=320, activity_threshold=1,
+                 morphology_operation="close", morphology_kernel=3,
+                 morphology_iterations=1, use_circularity=False,
                  min_circularity=0.1, max_jump_px=100.0,
-                 velocity_history_size=5, velocity_min_span_ms=3.0,
-                 stats_history_size=512, x_crop=None):
+                 reacquire_after_misses=3, velocity_history_size=5,
+                 velocity_min_span_ms=3.0, stats_history_size=512,
+                 x_crop=None, y_crop=None):
         self.width, self.height = int(width), int(height)
         self.bin_us = int(round(float(bin_ms) * 1000.0))
+        self.accumulation_window_us = int(round(
+            float(accumulation_window_ms) * 1000.0))
         if self.bin_us <= 0:
             raise ValueError("bin_ms must be positive")
-        self.history_limit_us = max(self.bin_us, int(history_limit_ms * 1000.0))
+        if self.accumulation_window_us < self.bin_us:
+            raise ValueError("accumulation_window_ms must be at least bin_ms")
+        configured_history_us = int(float(history_limit_ms) * 1000.0)
+        self.history_limit_us = max(
+            self.accumulation_window_us, configured_history_us)
         self.min_event_count = int(min_event_count)
         self.min_blob_area_px = int(min_blob_area_px)
         self.max_blob_area_px = int(max_blob_area_px)
+        self.min_blob_width_px = int(min_blob_width_px)
+        self.max_blob_width_px = int(max_blob_width_px)
+        self.min_blob_height_px = int(min_blob_height_px)
+        self.max_blob_height_px = int(max_blob_height_px)
         self.activity_threshold = max(1, int(activity_threshold))
+        operation = str(morphology_operation).strip().lower()
+        if operation not in self.MORPHOLOGY_OPERATIONS:
+            raise ValueError(
+                f"morphology_operation must be one of "
+                f"{self.MORPHOLOGY_OPERATIONS}")
+        self.morphology_operation = operation
         self.morphology_kernel = int(morphology_kernel)
         self.morphology_iterations = int(morphology_iterations)
         self.use_circularity = bool(use_circularity)
         self.min_circularity = float(min_circularity)
         self.max_jump_px = float(max_jump_px)
+        self.reacquire_after_misses = max(1, int(reacquire_after_misses))
+        self.missed_updates = 0
         if x_crop is None:
             x_crop = (0, self.width)
         if len(x_crop) != 2:
@@ -83,13 +118,34 @@ class EventBallTracker:
         if not 0 <= self.x_crop[0] < self.x_crop[1] <= self.width:
             raise ValueError(
                 f"x_crop must satisfy 0 <= lower < upper <= {self.width}")
+        if y_crop is None:
+            y_crop = (0, self.height, 0, self.height)
+        if len(y_crop) != 4:
+            raise ValueError(
+                "y_crop must contain left lower/upper and right lower/upper bounds")
+        self.y_crop = tuple(int(value) for value in y_crop)
+        left_lower, left_upper, right_lower, right_upper = self.y_crop
+        if not (0 <= left_lower < left_upper <= self.height and
+                0 <= right_lower < right_upper <= self.height):
+            raise ValueError(
+                "y_crop endpoint pairs must satisfy "
+                f"0 <= lower < upper <= {self.height}")
+
         self.velocity_min_span_us = float(velocity_min_span_ms) * 1000.0
         self.detections = deque(maxlen=max(2, int(velocity_history_size)))
         self._last_velocity = (0.0, 0.0)
+        self.previous_position = None
+
+        # Incomplete bins accept current/future events. Completed bins retain
+        # exact timestamps so non-bin-aligned sliding-window edges stay exact.
         self.pending = defaultdict(list)
+        self.pending_timestamps = defaultdict(list)
+        self.max_history_bins = (
+            int(math.ceil(self.history_limit_us / self.bin_us)) + 2)
+        self.history_bins = deque(maxlen=self.max_history_bins)
         self.next_bin_start_us = None
         self.max_seen_timestamp_us = None
-        self.previous_position = None
+
         self.counters = defaultdict(int)
         timing_names = (
             "map_build", "blob_detection", "computation", "velocity_fit",
@@ -101,72 +157,166 @@ class EventBallTracker:
         self._debug_lock = threading.Lock()
         self._latest_debug_snapshot = None
 
+    def _valid_event_coordinates(self, events):
+        x = events[:, 4].astype(np.int64)
+        y = events[:, 5].astype(np.int64)
+        valid = (x >= self.x_crop[0]) & (x < self.x_crop[1])
+        valid &= (x >= 0) & (x < self.width)
+        x_span = self.x_crop[1] - self.x_crop[0]
+        fraction = (x - self.x_crop[0]) / float(x_span)
+        lower_y = self.y_crop[0] + fraction * (
+            self.y_crop[2] - self.y_crop[0])
+        upper_y = self.y_crop[1] + fraction * (
+            self.y_crop[3] - self.y_crop[1])
+        valid &= (y >= lower_y) & (y < upper_y)
+        valid &= (y >= 0) & (y < self.height)
+        return x, y, valid
+
     def build_activity_map(self, events):
+        """Accumulate raw event multiplicity without morphology."""
         activity = np.zeros((self.height, self.width), dtype=np.uint16)
         if len(events):
             events = np.asarray(events)
-            x, y = events[:, 4].astype(np.int64), events[:, 5].astype(np.int64)
-            valid = (x >= 0) & (x < self.width) & (y >= 0) & (y < self.height)
-            valid &= (x >= self.x_crop[0]) & (x < self.x_crop[1])
+            x, y, valid = self._valid_event_coordinates(events)
             np.add.at(activity, (y[valid], x[valid]), 1)
         return activity
 
-    def _candidates(self, activity):
+    def _crop_mask(self):
+        """Return the exact pixel-center crop used for event acceptance."""
+        x = np.arange(self.width, dtype=np.float64)
+        x_span = self.x_crop[1] - self.x_crop[0]
+        fraction = (x - self.x_crop[0]) / float(x_span)
+        lower_y = self.y_crop[0] + fraction * (
+            self.y_crop[2] - self.y_crop[0])
+        upper_y = self.y_crop[1] + fraction * (
+            self.y_crop[3] - self.y_crop[1])
+        y = np.arange(self.height, dtype=np.float64)[:, None]
+        return ((x >= self.x_crop[0]) & (x < self.x_crop[1]) &
+                (y >= lower_y) & (y < upper_y))
+
+    def _grouping_mask(self, activity):
         mask = (activity >= self.activity_threshold).astype(np.uint8) * 255
-        if self.morphology_kernel > 0 and self.morphology_iterations > 0:
-            kernel = np.ones(
-                (self.morphology_kernel, self.morphology_kernel), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel,
-                                    iterations=self.morphology_iterations)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        result = []
-        for contour in contours:
-            area = int(cv2.countNonZero(cv2.drawContours(
-                np.zeros_like(mask), [contour], -1, 255, thickness=-1)))
-            if area < self.min_blob_area_px or area > self.max_blob_area_px:
-                continue
-            component = np.zeros_like(mask)
-            cv2.drawContours(component, [contour], -1, 1, thickness=-1)
-            weights = activity.astype(np.float64) * component
-            count = int(weights.sum())
-            if count < self.min_event_count:
-                continue
-            ys, xs = np.nonzero(weights)
-            x_com = float((weights[ys, xs] * xs).sum() / count)
-            y_com = float((weights[ys, xs] * ys).sum() / count)
+        if (self.morphology_operation == "none" or
+                self.morphology_kernel <= 0 or
+                self.morphology_iterations <= 0):
+            return mask * self._crop_mask().astype(np.uint8)
+        kernel = np.ones(
+            (self.morphology_kernel, self.morphology_kernel), np.uint8)
+        if self.morphology_operation == "close":
+            grouped = cv2.morphologyEx(
+                mask, cv2.MORPH_CLOSE, kernel,
+                iterations=self.morphology_iterations)
+        else:
+            # Explicit dilation is the only other allowed grouping operation.
+            grouped = cv2.dilate(
+                mask, kernel, iterations=self.morphology_iterations)
+        return grouped * self._crop_mask().astype(np.uint8)
+
+    def _candidate_rejection_reason(self, candidate):
+        if candidate["area"] < self.min_blob_area_px:
+            return "area_below_min"
+        if candidate["area"] > self.max_blob_area_px:
+            return "area_above_max"
+        if candidate["width"] < self.min_blob_width_px:
+            return "width_below_min"
+        if candidate["width"] > self.max_blob_width_px:
+            return "width_above_max"
+        if candidate["height"] < self.min_blob_height_px:
+            return "height_below_min"
+        if candidate["height"] > self.max_blob_height_px:
+            return "height_above_max"
+        if candidate["raw_event_count"] < self.min_event_count:
+            return "raw_event_count_below_min"
+        if candidate["raw_event_count"] <= 0:
+            return "no_raw_events"
+        if (self.use_circularity and
+                candidate["circularity"] < self.min_circularity):
+            return "circularity_below_min"
+        return ""
+
+    def _candidates(self, activity, predicted_position):
+        grouping_mask = self._grouping_mask(activity)
+        contours, _ = cv2.findContours(
+            grouping_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
+        for contour_index, contour in enumerate(contours):
+            filled = np.zeros_like(grouping_mask)
+            cv2.drawContours(filled, [contour], -1, 1, thickness=-1)
+            raw_weights = activity.astype(np.float64) * filled
+            raw_event_count = int(raw_weights.sum())
+            raw_y, raw_x = np.nonzero(raw_weights)
+            if raw_event_count > 0:
+                raw_values = raw_weights[raw_y, raw_x]
+                x_com = float((raw_values * raw_x).sum() / raw_event_count)
+                y_com = float((raw_values * raw_y).sum() / raw_event_count)
+            else:
+                x_com = y_com = 0.0
+            area = int(cv2.countNonZero(filled))
+            x, y, width, height = cv2.boundingRect(contour)
             perimeter = float(cv2.arcLength(contour, True))
             contour_area = float(cv2.contourArea(contour))
             circularity = (
                 4.0 * math.pi * contour_area / (perimeter ** 2)
                 if perimeter > 0 else 0.0)
-            if self.use_circularity and circularity < self.min_circularity:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            result.append(dict(x=x_com, y=y_com, area=area, count=count,
-                               bbox=(x, y, w, h), perimeter=perimeter,
-                               circularity=circularity, contour=contour))
-        return result, contours, mask
+            distance = (
+                math.hypot(x_com - predicted_position[0],
+                           y_com - predicted_position[1])
+                if predicted_position is not None and raw_event_count > 0
+                else 0.0)
+            candidate = {
+                "index": contour_index, "contour": contour,
+                "x": x_com, "y": y_com, "area": area,
+                "raw_event_count": raw_event_count,
+                "count": raw_event_count, "bbox": (x, y, width, height),
+                "width": width, "height": height, "perimeter": perimeter,
+                "circularity": circularity,
+                "distance_from_prediction_px": float(distance),
+                "rejection_reason": "",
+            }
+            candidate["rejection_reason"] = (
+                self._candidate_rejection_reason(candidate))
+            candidates.append(candidate)
+        return candidates, contours, grouping_mask
 
     def _predicted_position(self, timestamp_us):
         target = self.previous_position
-        if len(self.detections) >= 2:
+        if self.detections:
             t0, x0, y0 = self.detections[-1]
             dt = (timestamp_us - t0) / 1e6
             target = (x0 + self._last_velocity[0] * dt,
                       y0 + self._last_velocity[1] * dt)
         return target
 
-    def _select(self, candidates, target):
-        if not candidates:
-            return None
-        if target is None:
-            return min(candidates, key=lambda c: (-c["count"], c["y"], c["x"]))
-        ranked = sorted(candidates, key=lambda c: (
-            math.hypot(c["x"] - target[0], c["y"] - target[1]),
-            -c["count"], c["y"], c["x"]))
-        distance = math.hypot(
-            ranked[0]["x"] - target[0], ranked[0]["y"] - target[1])
-        return ranked[0] if distance <= self.max_jump_px else None
+    @staticmethod
+    def _initial_candidate_key(candidate):
+        return (-candidate["raw_event_count"], -candidate["area"],
+                candidate["y"], candidate["x"], candidate["index"])
+
+    def _select(self, candidates, predicted_position):
+        valid = [item for item in candidates if not item["rejection_reason"]]
+        if not valid:
+            return None, "no_valid_candidates"
+        if predicted_position is None:
+            return min(valid, key=self._initial_candidate_key), ""
+        near = []
+        for candidate in valid:
+            if candidate["distance_from_prediction_px"] <= self.max_jump_px:
+                near.append(candidate)
+            else:
+                candidate["rejection_reason"] = "beyond_max_jump"
+        if near:
+            selected = min(
+                near,
+                key=lambda item: (
+                    item["distance_from_prediction_px"],
+                    -item["raw_event_count"], -item["area"],
+                    item["y"], item["x"], item["index"]))
+            return selected, ""
+        if self.missed_updates + 1 >= self.reacquire_after_misses:
+            reacquired = min(valid, key=self._initial_candidate_key)
+            reacquired["rejection_reason"] = ""
+            return reacquired, "reacquired_after_misses"
+        return None, "all_candidates_beyond_max_jump"
 
     def _velocity(self):
         if len(self.detections) < 2:
@@ -181,67 +331,140 @@ class EventBallTracker:
         self._last_velocity = (vx, vy)
         return vx, vy, True
 
-    def _process_bin(self, start_us, events, parent_id):
+    def _complete_bins(self):
+        completed = 0
+        while (self.next_bin_start_us is not None and
+               self.next_bin_start_us + self.bin_us <=
+               self.max_seen_timestamp_us):
+            start = self.next_bin_start_us
+            rows = self.pending.pop(start, [])
+            timestamps = self.pending_timestamps.pop(start, [])
+            events_array = np.asarray(rows, dtype=np.uint16).reshape(-1, 6)
+            timestamps_array = np.asarray(timestamps, dtype=np.int64)
+            self.history_bins.append((start, events_array, timestamps_array))
+            self.next_bin_start_us += self.bin_us
+            completed += 1
+            self.counters["processed_1ms_bins"] += 1
+            self.counters["empty_bins"] += int(events_array.size == 0)
+        return completed
+
+    def _window_events(self, window_start_us, window_end_us):
+        event_chunks = []
+        timestamp_chunks = []
+        for _, events, timestamps in self.history_bins:
+            if not timestamps.size:
+                continue
+            selected = ((timestamps >= window_start_us) &
+                        (timestamps < window_end_us))
+            if np.any(selected):
+                event_chunks.append(events[selected])
+                timestamp_chunks.append(timestamps[selected])
+        if not event_chunks:
+            return (np.empty((0, 6), dtype=np.uint16),
+                    np.empty((0,), dtype=np.int64))
+        return np.concatenate(event_chunks), np.concatenate(timestamp_chunks)
+
+    def _trim_history(self, window_start_us):
+        history_cutoff = max(
+            window_start_us,
+            self.max_seen_timestamp_us - self.history_limit_us)
+        while (self.history_bins and
+               self.history_bins[0][0] + self.bin_us <= history_cutoff):
+            self.history_bins.popleft()
+
+    def _process_window(self, window_start_us, window_end_us, events,
+                        parent_id):
         total_start = time.monotonic_ns()
         t = time.monotonic_ns()
         activity = self.build_activity_map(events)
         self.timings["map_build"].append((time.monotonic_ns() - t) / 1e6)
+        predicted_position = self._predicted_position(window_end_us)
         t = time.monotonic_ns()
-        candidates, threshold_contours, threshold_mask = self._candidates(activity)
-        self.timings["blob_detection"].append((time.monotonic_ns() - t) / 1e6)
+        candidates, raw_contours, grouping_mask = self._candidates(
+            activity, predicted_position)
+        self.timings["blob_detection"].append(
+            (time.monotonic_ns() - t) / 1e6)
         self.counters["candidate_blob_count"] += len(candidates)
-        predicted_position = self._predicted_position(start_us)
-        selected = self._select(candidates, predicted_position)
-        detection = TrackerDetection(start_us, start_us + self.bin_us, parent_id,
-                                     int(activity.sum()), candidate_count=len(candidates),
-                                     start_steady_ns=total_start)
-        if selected is not None:
+        selected, selection_reason = self._select(
+            candidates, predicted_position)
+        window_event_count = int(activity.sum())
+        detection = TrackerDetection(
+            bin_start_us=window_start_us, bin_end_us=window_end_us,
+            parent_packet_id=parent_id, event_count=window_event_count,
+            window_start_us=window_start_us, window_end_us=window_end_us,
+            window_event_count=window_event_count,
+            candidate_count=len(candidates), start_steady_ns=total_start,
+            rejection_reason=selection_reason)
+        if selected is not None and selected["raw_event_count"] > 0:
             detection.valid = True
             detection.x_px, detection.y_px = selected["x"], selected["y"]
             detection.blob_area_px = selected["area"]
-            detection.blob_event_count = selected["count"]
+            detection.blob_event_count = selected["raw_event_count"]
+            detection.blob_width_px = selected["width"]
+            detection.blob_height_px = selected["height"]
+            detection.blob_perimeter_px = selected["perimeter"]
             detection.circularity = selected["circularity"]
             denominator = max(1.0, self.min_event_count * 2.0)
-            detection.confidence = min(1.0, selected["count"] / denominator)
+            detection.confidence = min(
+                1.0, selected["raw_event_count"] / denominator)
+            detection.rejection_reason = selection_reason
             self.previous_position = (detection.x_px, detection.y_px)
-            self.detections.append((start_us, detection.x_px, detection.y_px))
+            self.detections.append(
+                (window_end_us, detection.x_px, detection.y_px))
             t = time.monotonic_ns()
             vx, vy, ready = self._velocity()
-            self.timings["velocity_fit"].append((time.monotonic_ns() - t) / 1e6)
-            detection.vx_px_s, detection.vy_px_s, detection.velocity_valid = vx, vy, ready
+            self.timings["velocity_fit"].append(
+                (time.monotonic_ns() - t) / 1e6)
+            detection.vx_px_s, detection.vy_px_s = vx, vy
+            detection.velocity_valid = ready
             detection.speed_px_s = math.hypot(vx, vy)
+            self.missed_updates = 0
             self.counters["valid_detections"] += 1
             self.counters["velocity_ready_count"] += int(ready)
         else:
+            self.missed_updates += 1
             self.counters["invalid_detections"] += 1
         detection.end_steady_ns = time.monotonic_ns()
         elapsed = (detection.end_steady_ns - total_start) / 1e6
         self.timings["computation"].append(elapsed)
-        self.counters["processed_1ms_bins"] += 1
-        self.counters["empty_bins"] += int(detection.event_count == 0)
+        self.counters["window_updates"] += 1
+
+        accepted = tuple(
+            item["contour"].copy() for item in candidates
+            if not item["rejection_reason"] or item is selected)
+        details = tuple({
+            "area": item["area"], "width": item["width"],
+            "height": item["height"],
+            "raw_event_count": item["raw_event_count"],
+            "circularity": item["circularity"],
+            "distance_from_prediction_px":
+                item["distance_from_prediction_px"],
+            "rejection_reason": item["rejection_reason"],
+        } for item in candidates)
         snapshot = TrackerDebugSnapshot(
-            activity=activity.copy(), threshold_mask=threshold_mask.copy(),
+            activity=activity.copy(), threshold_mask=grouping_mask.copy(),
             detection=detection,
             candidate_contours=tuple(
-                contour.copy() for contour in threshold_contours),
-            accepted_candidate_contours=tuple(
-                candidate["contour"].copy() for candidate in candidates),
+                contour.copy() for contour in raw_contours),
+            accepted_candidate_contours=accepted,
             selected_contour=(
                 selected["contour"].copy() if selected is not None else None),
             predicted_position=predicted_position,
             trajectory=tuple(
                 (float(x), float(y)) for _, x, y in self.detections),
-            x_crop=self.x_crop)
+            x_crop=self.x_crop, y_crop=self.y_crop,
+            candidate_details=details)
         with self._debug_lock:
             self._latest_debug_snapshot = snapshot
         return detection
 
     def latest_debug_snapshot(self):
-        """Return the latest complete-bin snapshot, or None before the first bin."""
+        """Return the latest packet-level window snapshot, if available."""
         with self._debug_lock:
             return self._latest_debug_snapshot
 
     def update(self, packet: EventPacket):
+        """Integrate all complete bins and run at most one window detection."""
         update_start = time.monotonic_ns()
         self.counters["packets_received"] += 1
         self.counters["packets_with_events"] += int(packet.event_count > 0)
@@ -250,26 +473,31 @@ class EventBallTracker:
             elapsed_ms = (time.monotonic_ns() - update_start) / 1e6
             self.timings["total_tracker_update"].append(elapsed_ms)
             return []
-        for event, timestamp in zip(packet.events, packet.timestamps_us):
-            bin_start = int(timestamp // self.bin_us * self.bin_us)
-            if self.next_bin_start_us is not None and bin_start < self.next_bin_start_us:
-                self.counters["late_events_or_bins"] += 1
-                continue
-            self.pending[bin_start].append(event)
-        packet_max = packet.last_event_timestamp_us
+
         if self.next_bin_start_us is None:
             first_bin = packet.first_event_timestamp_us // self.bin_us
             self.next_bin_start_us = int(first_bin * self.bin_us)
-        self.max_seen_timestamp_us = max(packet_max, self.max_seen_timestamp_us or packet_max)
-        oldest = self.max_seen_timestamp_us - self.history_limit_us
-        for key in list(self.pending):
-            if key < oldest and key < self.next_bin_start_us:
-                del self.pending[key]
+        for event, timestamp in zip(packet.events, packet.timestamps_us):
+            bin_start = int(timestamp // self.bin_us * self.bin_us)
+            if bin_start < self.next_bin_start_us:
+                self.counters["late_events_or_bins"] += 1
+                continue
+            self.pending[bin_start].append(event)
+            self.pending_timestamps[bin_start].append(int(timestamp))
+        packet_max = packet.last_event_timestamp_us
+        self.max_seen_timestamp_us = max(
+            packet_max, self.max_seen_timestamp_us or packet_max)
+        completed = self._complete_bins()
         output = []
-        while self.next_bin_start_us + self.bin_us <= self.max_seen_timestamp_us:
-            rows = self.pending.pop(self.next_bin_start_us, [])
-            output.append(self._process_bin(self.next_bin_start_us, rows, packet.packet_id))
-            self.next_bin_start_us += self.bin_us
+        if completed > 0:
+            window_end_us = self.next_bin_start_us
+            window_start_us = window_end_us - self.accumulation_window_us
+            self._trim_history(window_start_us)
+            window_events, _ = self._window_events(
+                window_start_us, window_end_us)
+            output.append(self._process_window(
+                window_start_us, window_end_us, window_events,
+                packet.packet_id))
         elapsed_ms = (time.monotonic_ns() - update_start) / 1e6
         self.timings["total_tracker_update"].append(elapsed_ms)
         return output
@@ -278,8 +506,13 @@ class EventBallTracker:
         elapsed = max((time.monotonic_ns() - self.started_ns) / 1e9, 1e-9)
         result = dict(self.counters)
         result["event_rate_hz"] = result.get("events_received", 0) / elapsed
-        result["position_output_rate_hz"] = result.get("valid_detections", 0) / elapsed
-        result["detection_rate_hz"] = result.get("processed_1ms_bins", 0) / elapsed
+        result["processed_bin_rate_hz"] = (
+            result.get("processed_1ms_bins", 0) / elapsed)
+        result["window_update_rate_hz"] = (
+            result.get("window_updates", 0) / elapsed)
+        result["valid_detection_rate_hz"] = (
+            result.get("valid_detections", 0) / elapsed)
+        result["position_output_rate_hz"] = result["valid_detection_rate_hz"]
         for name, values in self.timings.items():
             array = np.asarray(values, dtype=float)
             result[name] = (
@@ -290,17 +523,29 @@ class EventBallTracker:
 
 
 def trace_detail_json(detection: TrackerDetection) -> str:
-    """Build strict finite JSON; sensor time belongs here, never in ROS stamps."""
-    detail = {"sensor_timestamp_domain": "genx320_microseconds",
-              "bin_start_us": detection.bin_start_us, "bin_end_us": detection.bin_end_us,
-              "event_count": detection.event_count, "x_px": detection.x_px,
-              "y_px": detection.y_px, "vx_px_s": detection.vx_px_s,
-              "vy_px_s": detection.vy_px_s, "speed_px_s": detection.speed_px_s,
-              "blob_area_px": detection.blob_area_px,
-              "blob_event_count": detection.blob_event_count,
-              "circularity": detection.circularity,
-              "candidate_count": detection.candidate_count,
-              "velocity_valid": detection.velocity_valid}
+    """Build finite JSON with sensor timestamps outside ROS stamp fields."""
+    detail = {
+        "sensor_timestamp_domain": "genx320_microseconds",
+        "window_start_us": detection.window_start_us,
+        "window_end_us": detection.window_end_us,
+        "window_event_count": detection.window_event_count,
+        "bin_start_us": detection.bin_start_us,
+        "bin_end_us": detection.bin_end_us,
+        "event_count": detection.event_count,
+        "candidate_count": detection.candidate_count,
+        "selected_raw_event_count": detection.blob_event_count,
+        "x_px": detection.x_px, "y_px": detection.y_px,
+        "vx_px_s": detection.vx_px_s, "vy_px_s": detection.vy_px_s,
+        "speed_px_s": detection.speed_px_s,
+        "blob_area_px": detection.blob_area_px,
+        "blob_width_px": detection.blob_width_px,
+        "blob_height_px": detection.blob_height_px,
+        "blob_perimeter_px": detection.blob_perimeter_px,
+        "circularity": detection.circularity,
+        "velocity_valid": detection.velocity_valid,
+        "valid": detection.valid,
+        "rejection_reason": detection.rejection_reason,
+    }
     return json.dumps(detail, allow_nan=False, separators=(",", ":"))
 
 
@@ -319,19 +564,21 @@ def _rotate_debug_layer(image, rotation_degrees):
 
 
 def _debug_text(image, snapshot, stage):
-    """Add upright stage and tracker metadata."""
+    """Add upright stage and sliding-window metadata."""
     detection = snapshot.detection
     line1 = (
-        f"{stage} bin [{detection.bin_start_us},{detection.bin_end_us}) us "
-        f"events={detection.event_count} candidates={detection.candidate_count}")
+        f"{stage} win [{detection.window_start_us},"
+        f"{detection.window_end_us}) us events={detection.window_event_count} "
+        f"cand={detection.candidate_count}")
     velocity = (
         f"v=({detection.vx_px_s:.1f},{detection.vy_px_s:.1f}) px/s"
         if detection.velocity_valid else "v=not ready")
     line2 = (
         f"valid={str(detection.valid).lower()} {velocity} "
-        f"x=[{snapshot.x_crop[0]},{snapshot.x_crop[1]})")
+        f"x=[{snapshot.x_crop[0]},{snapshot.x_crop[1]}) "
+        f"y={snapshot.y_crop or 'full'}")
     cv2.putText(image, line1, (4, 14), cv2.FONT_HERSHEY_SIMPLEX,
-                0.35, (255, 255, 255), 1, cv2.LINE_AA)
+                0.33, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(image, line2, (4, 29), cv2.FONT_HERSHEY_SIMPLEX,
                 0.35, (255, 255, 255), 1, cv2.LINE_AA)
     return image
@@ -340,7 +587,7 @@ def _debug_text(image, snapshot, stage):
 def render_debug_images(snapshot: TrackerDebugSnapshot, clip_count=16,
                         velocity_scale_s=0.02,
                         rotation_degrees=90):
-    """Render synchronized BGR images for each tracker stage."""
+    """Render synchronized BGR images for each sliding-window stage."""
     clip_count = max(1, int(clip_count))
     gray = np.rint(
         np.minimum(snapshot.activity, clip_count) * (255.0 / clip_count)
@@ -353,7 +600,8 @@ def render_debug_images(snapshot: TrackerDebugSnapshot, clip_count=16,
     accepted_ids = {
         contour.tobytes() for contour in snapshot.accepted_candidate_contours}
     for contour in snapshot.candidate_contours:
-        color = (0, 0, 255) if contour.tobytes() in accepted_ids else (0, 128, 255)
+        color = ((0, 0, 255) if contour.tobytes() in accepted_ids
+                 else (0, 128, 255))
         cv2.drawContours(contours, [contour], -1, color, 1)
 
     selected = snapshot.selected_contour
@@ -371,25 +619,32 @@ def render_debug_images(snapshot: TrackerDebugSnapshot, clip_count=16,
                        cv2.MARKER_CROSS, 9, 1)
     if len(snapshot.trajectory) >= 2:
         points = np.rint(snapshot.trajectory).astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(tracking, [points], False, (255, 0, 0), 1, cv2.LINE_AA)
+        cv2.polylines(tracking, [points], False, (255, 0, 0), 1,
+                      cv2.LINE_AA)
     if detection.valid:
         center = (int(round(detection.x_px)), int(round(detection.y_px)))
         cv2.circle(tracking, center, 3, (0, 255, 0), thickness=-1)
         if detection.velocity_valid:
             tip = (
-                int(round(detection.x_px + detection.vx_px_s * velocity_scale_s)),
-                int(round(detection.y_px + detection.vy_px_s * velocity_scale_s)))
+                int(round(detection.x_px +
+                          detection.vx_px_s * velocity_scale_s)),
+                int(round(detection.y_px +
+                          detection.vy_px_s * velocity_scale_s)))
             cv2.arrowedLine(tracking, center, tip, (255, 255, 0), 1,
                             cv2.LINE_AA, tipLength=0.25)
 
     images = {"activity": activity, "threshold": threshold,
               "contours": contours, "tracking": tracking}
     lower_x, upper_x = snapshot.x_crop
+    y_crop = snapshot.y_crop or (
+        0, snapshot.activity.shape[0], 0, snapshot.activity.shape[0])
+    left_lower, left_upper, right_lower, right_upper = y_crop
+    crop_polygon = np.asarray([
+        (lower_x, left_lower), (upper_x - 1, right_lower),
+        (upper_x - 1, right_upper - 1), (lower_x, left_upper - 1),
+    ], dtype=np.int32).reshape(-1, 1, 2)
     for image in images.values():
-        cv2.line(image, (lower_x, 0), (lower_x, image.shape[0] - 1),
-                 (255, 0, 255), 1)
-        cv2.line(image, (upper_x - 1, 0),
-                 (upper_x - 1, image.shape[0] - 1), (255, 0, 255), 1)
+        cv2.polylines(image, [crop_polygon], True, (255, 0, 255), 1)
     return {
         stage: _debug_text(
             _rotate_debug_layer(image, rotation_degrees), snapshot, stage)
@@ -399,6 +654,6 @@ def render_debug_images(snapshot: TrackerDebugSnapshot, clip_count=16,
 def render_debug_image(snapshot: TrackerDebugSnapshot, clip_count=16,
                        velocity_scale_s=0.02,
                        rotation_degrees=90) -> np.ndarray:
-    """Render the backwards-compatible combined tracking debug image."""
+    """Render the compatibility alias of the final tracking debug image."""
     return render_debug_images(
         snapshot, clip_count, velocity_scale_s, rotation_degrees)["tracking"]

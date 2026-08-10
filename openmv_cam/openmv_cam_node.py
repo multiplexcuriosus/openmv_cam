@@ -37,6 +37,7 @@ from .event_output_mode import resolve_event_outputs
 from .image_rotation import SUPPORTED_ROTATIONS_DEG, rotate_event_frame
 from .event_ball_tracker import (
     EventBallTracker,
+    render_debug_event_frame,
     render_debug_images,
     trace_detail_json,
 )
@@ -164,7 +165,7 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("event_replay_loop", False)
 
         # Raw-packet event ball tracker (native, unrotated OpenMV coordinates).
-        self.declare_parameter("event_tracker_enabled", False)
+        self.declare_parameter("event_tracker_enabled", True)
         self.declare_parameter(
             "event_tracker_position_topic",
             "/openmv_cam/event_tracker/ball_2d_px")
@@ -174,7 +175,7 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter(
             "event_tracker_valid_topic", "/openmv_cam/event_tracker/valid")
         self.declare_parameter("event_tracker_bin_ms", 1.0)
-        self.declare_parameter("event_tracker_accumulation_window_ms", 10.0)
+        self.declare_parameter("event_tracker_accumulation_window_ms", 3.0)
         self.declare_parameter("event_tracker_history_limit_ms", 100.0)
         self.declare_parameter("event_tracker_activity_threshold", 1)
         self.declare_parameter("event_tracker_spatial_filter_enabled", False)
@@ -182,24 +183,24 @@ class OpenMVEventCamNode(Node):
             "event_tracker_spatial_filter_min_neighbors", 1)
         self.declare_parameter(
             "event_tracker_spatial_filter_min_component_area_px", 1)
-        self.declare_parameter("event_tracker_min_event_count", 3)
-        self.declare_parameter("event_tracker_min_blob_area_px", 2)
-        self.declare_parameter("event_tracker_max_blob_area_px", 2000)
+        self.declare_parameter("event_tracker_min_event_count", 1)
+        self.declare_parameter("event_tracker_min_blob_area_px", 250)
+        self.declare_parameter("event_tracker_max_blob_area_px", 1500)
         self.declare_parameter("event_tracker_min_blob_width_px", 1)
         self.declare_parameter("event_tracker_max_blob_width_px", 320)
         self.declare_parameter("event_tracker_min_blob_height_px", 1)
         self.declare_parameter("event_tracker_max_blob_height_px", 320)
-        self.declare_parameter("event_tracker_morphology_operation", "close")
+        self.declare_parameter("event_tracker_morphology_operation", "dilate")
         self.declare_parameter("event_tracker_morphology_kernel", 3)
-        self.declare_parameter("event_tracker_morphology_iterations", 1)
+        self.declare_parameter("event_tracker_morphology_iterations", 3)
         self.declare_parameter("event_tracker_use_circularity", False)
         self.declare_parameter("event_tracker_min_circularity", 0.1)
         self.declare_parameter("event_tracker_max_jump_px", 100.0)
         self.declare_parameter("event_tracker_reacquire_after_misses", 3)
-        self.declare_parameter("event_tracker_x_crop", [80, 215])
+        self.declare_parameter("event_tracker_x_crop", [100, 210])
         self.declare_parameter("event_tracker_y_crop", [35, 275, 85, 235])
-        self.declare_parameter("event_tracker_velocity_history_size", 5)
-        self.declare_parameter("event_tracker_velocity_min_span_ms", 3.0)
+        self.declare_parameter("event_tracker_velocity_history_size", 4)
+        self.declare_parameter("event_tracker_velocity_min_span_ms", 1.0)
         self.declare_parameter("event_tracker_stats_period_sec", 5.0)
         self.declare_parameter("event_tracker_debug_enabled", False)
         self.declare_parameter(
@@ -208,6 +209,13 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("event_tracker_debug_fps", 10.0)
         self.declare_parameter("event_tracker_debug_clip_count", 16)
         self.declare_parameter("event_tracker_debug_rotation_degrees", 90)
+        self.declare_parameter(
+            "event_tracker_debug_event_frame_enabled", True)
+        self.declare_parameter(
+            "event_tracker_debug_event_frame_topic",
+            "/openmv_cam/event_tracker/debug/event_frame_33ms")
+        self.declare_parameter(
+            "event_tracker_debug_event_frame_window_ms", 33.0)
         self.declare_parameter(
             "event_tracker_debug_activity_topic",
             "/openmv_cam/event_tracker/debug/activity")
@@ -318,11 +326,17 @@ class OpenMVEventCamNode(Node):
         self.event_tracker_valid_pub = None
         self.event_tracker_debug_pub = None
         self.event_tracker_debug_stage_pubs = {}
+        self.event_tracker_debug_event_frame_pub = None
         self.event_tracker_debug_timer = None
         self._last_tracker_debug_bin_start_us = None
         self.latency_trace_pub = None
         self.LatencyTrace = None
         self._tracker_trace_sequence = 0
+        tracker_debug_enabled = bool(
+            self.get_parameter("event_tracker_debug_enabled").value)
+        tracker_debug_event_frame_enabled = (
+            tracker_debug_enabled and bool(self.get_parameter(
+                "event_tracker_debug_event_frame_enabled").value))
         if self.event_tracker_enabled:
             self.event_tracker = EventBallTracker(
                 width=self.W, height=self.H,
@@ -373,6 +387,10 @@ class OpenMVEventCamNode(Node):
                     "event_tracker_velocity_history_size").value),
                 velocity_min_span_ms=float(self.get_parameter(
                     "event_tracker_velocity_min_span_ms").value),
+                debug_event_frame_window_ms=(
+                    float(self.get_parameter(
+                        "event_tracker_debug_event_frame_window_ms").value)
+                    if tracker_debug_event_frame_enabled else None),
             )
             self.event_tracker_position_pub = self.create_publisher(
                 PointStamped,
@@ -387,7 +405,7 @@ class OpenMVEventCamNode(Node):
                 10)
             self.event_tracker_stats_timer = self.create_timer(
                 self.event_tracker_stats_period_sec, self._event_tracker_stats_cb)
-            if bool(self.get_parameter("event_tracker_debug_enabled").value):
+            if tracker_debug_enabled:
                 debug_fps = float(
                     self.get_parameter("event_tracker_debug_fps").value)
                 if not np.isfinite(debug_fps) or debug_fps <= 0.0:
@@ -407,6 +425,12 @@ class OpenMVEventCamNode(Node):
                     stage: self.create_publisher(
                         Image, str(self.get_parameter(parameter).value), 10)
                     for stage, parameter in stage_topic_parameters.items()}
+                if tracker_debug_event_frame_enabled:
+                    self.event_tracker_debug_event_frame_pub = (
+                        self.create_publisher(
+                            Image, str(self.get_parameter(
+                                "event_tracker_debug_event_frame_topic").value),
+                            10))
                 self.event_tracker_debug_timer = self.create_timer(
                     1.0 / debug_fps, self._event_tracker_debug_timer_cb)
             if bool(self.get_parameter("publish_latency_traces").value):
@@ -1498,6 +1522,18 @@ class OpenMVEventCamNode(Node):
             message.header.stamp = stamp
             message.header.frame_id = "openmv_cam"
             self.event_tracker_debug_stage_pubs[stage].publish(message)
+        if self.event_tracker_debug_event_frame_pub is not None:
+            event_frame = render_debug_event_frame(
+                snapshot, width=self.W, height=self.H,
+                contrast=self.contrast, step=self.step,
+                rotation_degrees=int(self.get_parameter(
+                    "event_tracker_debug_rotation_degrees").value))
+            event_frame_message = self.bridge.cv2_to_imgmsg(
+                event_frame, encoding="bgr8")
+            event_frame_message.header.stamp = stamp
+            event_frame_message.header.frame_id = "openmv_cam"
+            self.event_tracker_debug_event_frame_pub.publish(
+                event_frame_message)
         # Preserve the original combined topic as an alias of the tracking stage.
         combined = self.bridge.cv2_to_imgmsg(images["tracking"], encoding="bgr8")
         combined.header.stamp = stamp

@@ -10,10 +10,11 @@ from openmv_cam.event_ball_tracker import (
     TrackerDebugSnapshot,
     TrackerDetection,
     render_debug_image,
+    render_debug_event_frame,
     render_debug_images,
     trace_detail_json,
 )
-from openmv_cam.evt1_protocol import EventPacket
+from openmv_cam.evt1_protocol import EventPacket, reconstruct_timestamps_us
 
 
 def packet(rows, packet_id=1, ros_ns=9_000_000_000):
@@ -57,6 +58,45 @@ def test_ten_ms_window_combines_several_adjacent_bins():
     snapshot = subject.latest_debug_snapshot()
     assert snapshot.activity.sum() == 4
     assert all(snapshot.activity[20, x] == 1 for x in range(10, 14))
+    assert snapshot.debug_events is None
+
+
+def test_debug_event_frame_selects_exact_sensor_time_interval():
+    subject = tracker(
+        x_crop=(0, 300), debug_event_frame_window_ms=33.0)
+    rows = [
+        event(8999, 10, 10), event(9000, 11, 10),
+        event(10_000, 15, 10),
+        event(20_000, 12, 10), event(41_999, 13, 10),
+        event(42_000, 14, 10),
+    ]
+    complete_window(subject, rows)
+    snapshot = subject.latest_debug_snapshot()
+    assert snapshot.detection.window_end_us == 43_000
+    assert reconstruct_timestamps_us(snapshot.debug_events).tolist() == [
+        10_000, 20_000, 41_999, 42_000]
+    assert 319 not in snapshot.debug_events[:, 4]
+    assert not snapshot.debug_events.flags.writeable
+
+
+@pytest.mark.parametrize("source", ["hardware", "hdf5_replay"])
+def test_debug_event_capture_supports_hardware_and_replay_packets(source):
+    subject = tracker(
+        x_crop=(0, 300), debug_event_frame_window_ms=33.0)
+    if source == "hardware":
+        source_packet = packet([
+            event(10_000, 10, 20), event(11_000, 319, 319)])
+    else:
+        source_packet = EventPacket.from_recorded_arrays(
+            event_type=np.asarray([1, 1]),
+            event_x=np.asarray([10, 319]), event_y=np.asarray([20, 319]),
+            timestamps_us=np.asarray([10_000, 11_000]), packet_id=1,
+            packet_ros_stamp_ns=1, packet_monotonic_stamp_ns=2,
+            original_ros_stamp_ns=3, original_monotonic_stamp_ns=4)
+    assert subject.update(source_packet)
+    snapshot = subject.latest_debug_snapshot()
+    assert snapshot.debug_events.shape == (1, 6)
+    assert snapshot.debug_events[0, 4:6].tolist() == [10, 20]
 
 
 def test_events_older_than_window_are_removed():
@@ -272,6 +312,84 @@ def test_debug_distinguishes_removed_rejected_and_selected_contours():
     assert tracking[80, 20].tolist() == [255, 255, 0]
     assert tracking[90, 30].tolist() == [0, 128, 255]
     assert tracking[100, 40].tolist() == [0, 255, 0]
+
+
+def test_contours_debug_labels_biggest_contour_area(monkeypatch):
+    small = np.asarray([[[20, 80]], [[21, 80]], [[21, 81]], [[20, 81]]],
+                       dtype=np.int32)
+    large = np.asarray([[[50, 100]], [[54, 100]], [[54, 103]], [[50, 103]]],
+                       dtype=np.int32)
+    detection = TrackerDetection(0, 1000, 1, 0)
+    snapshot = TrackerDebugSnapshot(
+        activity=np.zeros((320, 320), dtype=np.uint16),
+        threshold_mask=np.zeros((320, 320), dtype=np.uint8),
+        detection=detection, candidate_contours=(small, large),
+        accepted_candidate_contours=(), selected_contour=None,
+        predicted_position=None, trajectory=(), x_crop=(0, 320),
+        candidate_details=({"area": 4}, {"area": 20}))
+    labels = []
+    original = cv2.putText
+    original_rotate = cv2.rotate
+    rotations = []
+
+    def record_label(image, text, *args, **kwargs):
+        labels.append(text)
+        return original(image, text, *args, **kwargs)
+
+    def record_rotation(image, operation):
+        rotations.append(operation)
+        return original_rotate(image, operation)
+
+    monkeypatch.setattr(cv2, "putText", record_label)
+    monkeypatch.setattr(cv2, "rotate", record_rotation)
+    render_debug_images(snapshot, rotation_degrees=0)
+    assert labels.count("area=20") == 1
+    assert "area=4" not in labels
+    assert rotations == [cv2.ROTATE_90_CLOCKWISE]
+
+
+def debug_event_snapshot(*, valid, x=0.0, y=0.0):
+    detection = TrackerDetection(
+        0, 33_000, 1, 1, window_start_us=0, window_end_us=33_000,
+        valid=valid, x_px=x, y_px=y)
+    events = np.asarray([event(32_000, 100, 120)], dtype=np.uint16)
+    events.setflags(write=False)
+    return TrackerDebugSnapshot(
+        activity=np.zeros((320, 320), dtype=np.uint16),
+        threshold_mask=np.zeros((320, 320), dtype=np.uint8),
+        detection=detection, candidate_contours=(),
+        accepted_candidate_contours=(), selected_contour=None,
+        predicted_position=None, trajectory=(), x_crop=(0, 320),
+        debug_events=events)
+
+
+def test_debug_event_frame_uses_newest_valid_snapshot_com():
+    older = debug_event_snapshot(valid=True, x=20.0, y=30.0)
+    newest = debug_event_snapshot(valid=True, x=70.0, y=80.0)
+    older_image = render_debug_event_frame(older, rotation_degrees=0)
+    newest_image = render_debug_event_frame(newest, rotation_degrees=0)
+    assert older_image[30, 20].tolist() == [0, 0, 255]
+    assert newest_image[80, 70].tolist() == [0, 0, 255]
+    assert newest_image[30, 20].tolist() != [0, 0, 255]
+
+
+def test_invalid_debug_event_detection_has_no_red_origin_marker():
+    snapshot = debug_event_snapshot(valid=False, x=0.0, y=0.0)
+    image = render_debug_event_frame(snapshot, rotation_degrees=0)
+    assert image[0, 0].tolist() == [128, 128, 128]
+    assert not np.any(
+        (image[:, :, 0] == 0) & (image[:, :, 1] == 0) &
+        (image[:, :, 2] == 255))
+
+
+def test_debug_event_frame_rotation_moves_com_with_background():
+    snapshot = debug_event_snapshot(valid=True, x=70.0, y=80.0)
+    native = render_debug_event_frame(snapshot, rotation_degrees=0)
+    rotated = render_debug_event_frame(snapshot, rotation_degrees=90)
+    assert native[80, 70].tolist() == [0, 0, 255]
+    assert rotated[320 - 1 - 70, 80].tolist() == [0, 0, 255]
+    assert np.array_equal(rotated, cv2.rotate(
+        native, cv2.ROTATE_90_COUNTERCLOCKWISE))
 
 
 def test_dilation_groups_but_cannot_bias_raw_event_com():

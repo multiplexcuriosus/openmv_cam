@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .event_frame_contract import render_event_frame_from_arrays
 from .evt1_protocol import EventPacket
 
 
@@ -60,6 +61,7 @@ class TrackerDebugSnapshot:
     y_crop: tuple = ()
     candidate_details: tuple = ()
     removed_component_contours: tuple = ()
+    debug_events: object = None
 
 
 class EventBallTracker:
@@ -81,7 +83,8 @@ class EventBallTracker:
                  min_circularity=0.1, max_jump_px=100.0,
                  reacquire_after_misses=3, velocity_history_size=5,
                  velocity_min_span_ms=3.0, stats_history_size=512,
-                 x_crop=None, y_crop=None):
+                 x_crop=None, y_crop=None,
+                 debug_event_frame_window_ms=None):
         self.width, self.height = int(width), int(height)
         self.bin_us = int(round(float(bin_ms) * 1000.0))
         self.accumulation_window_us = int(round(
@@ -93,6 +96,15 @@ class EventBallTracker:
         configured_history_us = int(float(history_limit_ms) * 1000.0)
         self.history_limit_us = max(
             self.accumulation_window_us, configured_history_us)
+        self.debug_event_frame_window_us = (
+            None if debug_event_frame_window_ms is None else
+            int(round(float(debug_event_frame_window_ms) * 1000.0)))
+        if (self.debug_event_frame_window_us is not None and
+                self.debug_event_frame_window_us <= 0):
+            raise ValueError("debug_event_frame_window_ms must be positive")
+        if self.debug_event_frame_window_us is not None:
+            self.history_limit_us = max(
+                self.history_limit_us, self.debug_event_frame_window_us)
         self.min_event_count = int(min_event_count)
         self.min_blob_area_px = int(min_blob_area_px)
         self.max_blob_area_px = int(max_blob_area_px)
@@ -423,8 +435,13 @@ class EventBallTracker:
         return np.concatenate(event_chunks), np.concatenate(timestamp_chunks)
 
     def _trim_history(self, window_start_us):
+        retention_start_us = window_start_us
+        if self.debug_event_frame_window_us is not None:
+            retention_start_us = min(
+                retention_start_us,
+                self.next_bin_start_us - self.debug_event_frame_window_us)
         history_cutoff = max(
-            window_start_us,
+            retention_start_us,
             self.max_seen_timestamp_us - self.history_limit_us)
         while (self.history_bins and
                self.history_bins[0][0] + self.bin_us <= history_cutoff):
@@ -499,6 +516,13 @@ class EventBallTracker:
                 item["distance_from_prediction_px"],
             "rejection_reason": item["rejection_reason"],
         } for item in candidates)
+        debug_events = None
+        if self.debug_event_frame_window_us is not None:
+            debug_start_us = window_end_us - self.debug_event_frame_window_us
+            debug_events, _ = self._window_events(
+                debug_start_us, window_end_us)
+            debug_events = debug_events.copy()
+            debug_events.setflags(write=False)
         snapshot = TrackerDebugSnapshot(
             activity=activity.copy(), threshold_mask=grouping_mask.copy(),
             detection=detection,
@@ -514,7 +538,8 @@ class EventBallTracker:
             candidate_details=details,
             removed_component_contours=tuple(
                 contour.copy() for contour in
-                self._last_removed_component_contours))
+                self._last_removed_component_contours),
+            debug_events=debug_events)
         with self._debug_lock:
             self._latest_debug_snapshot = snapshot
         return detection
@@ -675,6 +700,34 @@ def render_debug_images(snapshot: TrackerDebugSnapshot, clip_count=16,
                  else (0, 128, 255))
         cv2.drawContours(contours, [contour], -1, color, 1)
 
+    contour_details = list(zip(
+        snapshot.candidate_contours, snapshot.candidate_details))
+    if contour_details:
+        largest_contour, largest_detail = max(
+            contour_details, key=lambda item: item[1]["area"])
+        x, y, width, _ = cv2.boundingRect(largest_contour)
+        label = f"area={largest_detail['area']}"
+        text_size = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+        label_layer = np.zeros(
+            (text_size[1] + 6, text_size[0] + 4, 3), dtype=np.uint8)
+        cv2.putText(
+            label_layer, label, (2, text_size[1] + 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1,
+            cv2.LINE_AA)
+        label_layer = cv2.rotate(label_layer, cv2.ROTATE_90_CLOCKWISE)
+        label_height, label_width = label_layer.shape[:2]
+        label_x = x + width + 3
+        if label_x + label_width >= contours.shape[1]:
+            label_x = max(0, x - label_width - 3)
+        label_y = min(
+            max(0, y), max(0, contours.shape[0] - label_height))
+        target = contours[
+            label_y:label_y + label_height,
+            label_x:label_x + label_width]
+        label_mask = np.any(label_layer != 0, axis=2)
+        target[label_mask] = label_layer[label_mask]
+
     selected = snapshot.selected_contour
     for contour in snapshot.candidate_contours:
         if selected is not None and np.array_equal(contour, selected):
@@ -728,3 +781,24 @@ def render_debug_image(snapshot: TrackerDebugSnapshot, clip_count=16,
     """Render the compatibility alias of the final tracking debug image."""
     return render_debug_images(
         snapshot, clip_count, velocity_scale_s, rotation_degrees)["tracking"]
+
+
+def render_debug_event_frame(snapshot: TrackerDebugSnapshot, *, width=320,
+                             height=320, contrast=4.0, step=1.0,
+                             rotation_degrees=90) -> np.ndarray:
+    """Render copied sensor-time events with the latest valid COM in red."""
+    events = snapshot.debug_events
+    if events is None:
+        raise ValueError("snapshot does not contain debug event-frame events")
+    mono = render_event_frame_from_arrays(
+        event_type=events[:, 0], event_x=events[:, 4], event_y=events[:, 5],
+        width=width, height=height, scaling_mode="legacy_per_frame_max",
+        contrast=contrast, step=step)
+    image = cv2.cvtColor(mono, cv2.COLOR_GRAY2BGR)
+    detection = snapshot.detection
+    if detection.valid:
+        center = (int(round(detection.x_px)), int(round(detection.y_px)))
+        cv2.circle(image, center, 5, (0, 0, 255), 1, cv2.LINE_8)
+        cv2.drawMarker(image, center, (0, 0, 255), cv2.MARKER_CROSS,
+                       11, 1, cv2.LINE_8)
+    return _rotate_debug_layer(image, rotation_degrees)

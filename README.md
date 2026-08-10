@@ -163,33 +163,34 @@ y down, and `frame_id=openmv_cam`. Tracker coordinates are never rotated.
 Message header stamps are the host ROS publication time. Sensor microseconds
 are used for binning and velocity only; they are not ROS epoch timestamps.
 
-The tracker defaults to disabled. Important parameters and defaults are:
+The tracker defaults to enabled with the tuned ball-tracking configuration.
+Important parameters and defaults are:
 
-- `event_tracker_enabled=false`
+- `event_tracker_enabled=true`
 - `event_tracker_position_topic=/openmv_cam/event_tracker/ball_2d_px`
 - `event_tracker_velocity_topic=/openmv_cam/event_tracker/ball_velocity_px_s`
 - `event_tracker_valid_topic=/openmv_cam/event_tracker/valid`
 - `event_tracker_bin_ms=1.0`
-- `event_tracker_accumulation_window_ms=10.0`
+- `event_tracker_accumulation_window_ms=3.0`
 - `event_tracker_history_limit_ms=100.0`
 - `event_tracker_activity_threshold=1`
 - `event_tracker_spatial_filter_enabled=false`
 - `event_tracker_spatial_filter_min_neighbors=1`
 - `event_tracker_spatial_filter_min_component_area_px=1`
-- `event_tracker_min_event_count=3`
-- `event_tracker_min_blob_area_px=2`, `event_tracker_max_blob_area_px=2000`
+- `event_tracker_min_event_count=1`
+- `event_tracker_min_blob_area_px=250`, `event_tracker_max_blob_area_px=1500`
 - `event_tracker_min_blob_width_px=1`, `event_tracker_max_blob_width_px=320`
 - `event_tracker_min_blob_height_px=1`, `event_tracker_max_blob_height_px=320`
-- `event_tracker_morphology_operation=close`
+- `event_tracker_morphology_operation=dilate`
 - `event_tracker_morphology_kernel=3`,
-  `event_tracker_morphology_iterations=1`
+  `event_tracker_morphology_iterations=3`
 - `event_tracker_use_circularity=false`, `event_tracker_min_circularity=0.1`
 - `event_tracker_max_jump_px=100.0`
 - `event_tracker_reacquire_after_misses=3`
-- `event_tracker_x_crop=[80, 215]`
+- `event_tracker_x_crop=[100, 210]`
 - `event_tracker_y_crop=[35, 275, 85, 235]`
-- `event_tracker_velocity_history_size=5`
-- `event_tracker_velocity_min_span_ms=3.0`
+- `event_tracker_velocity_history_size=4`
+- `event_tracker_velocity_min_span_ms=1.0`
 - `event_tracker_stats_period_sec=5.0`
 - `event_tracker_debug_enabled=false`
 - `event_tracker_debug_topic=/openmv_cam/event_tracker/debug_image`
@@ -209,6 +210,9 @@ ros2 launch openmv_cam openmv.launch.py \
 - `event_tracker_debug_fps=10.0`
 - `event_tracker_debug_clip_count=16`
 - `event_tracker_debug_rotation_degrees=90`
+- `event_tracker_debug_event_frame_enabled=true`
+- `event_tracker_debug_event_frame_topic=/openmv_cam/event_tracker/debug/event_frame_33ms`
+- `event_tracker_debug_event_frame_window_ms=33.0`
 - `event_tracker_debug_activity_topic=/openmv_cam/event_tracker/debug/activity`
 - `event_tracker_debug_threshold_topic=/openmv_cam/event_tracker/debug/threshold`
 - `event_tracker_debug_contours_topic=/openmv_cam/event_tracker/debug/contours`
@@ -233,6 +237,9 @@ images at no more than `event_tracker_debug_fps`:
 - `debug/threshold`: grouping mask after configured close/dilation.
 - `debug/contours`: filtered-in contours in red and rejected contours in orange.
 - `debug/tracking`: selection, COM, prediction, trajectory, and velocity.
+- `debug/event_frame_33ms`: native mono-polarity event rendering for the exact
+  newest 33 ms of completed tracker sensor time, with a valid newest COM marked
+  red before applying the configured debug rotation.
 
 The original `/openmv_cam/event_tracker/debug_image` remains as a compatibility
 alias of `debug/tracking`.
@@ -267,6 +274,16 @@ ros2 launch openmv_cam openmv.launch.py \
   event_tracker_debug_enabled:=true \
   event_tracker_debug_fps:=10.0 \
   event_tracker_debug_clip_count:=16
+```
+
+The sensor-time event-frame diagnostic does not depend on preview publishing:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py \
+  event_tracker_enabled:=true \
+  event_tracker_debug_enabled:=true \
+  event_tracker_debug_event_frame_enabled:=true \
+  event_tracker_debug_event_frame_window_ms:=33.0
 ```
 
 Optional latency traces use best-effort QoS on

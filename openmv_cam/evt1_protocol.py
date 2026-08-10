@@ -35,6 +35,9 @@ class EventPacket:
     timestamps_us: np.ndarray
     first_event_timestamp_us: int
     last_event_timestamp_us: int
+    source: str = "hardware"
+    original_ros_stamp_ns: int = -1
+    original_monotonic_stamp_ns: int = -1
 
     @classmethod
     def decode(
@@ -66,4 +69,49 @@ class EventPacket:
             packet_monotonic_stamp_ns=int(packet_monotonic_stamp_ns),
             timestamps_us=timestamps, first_event_timestamp_us=first,
             last_event_timestamp_us=last,
+        )
+
+    @classmethod
+    def from_recorded_arrays(
+        cls, *, event_type: np.ndarray, event_x: np.ndarray,
+        event_y: np.ndarray, timestamps_us: np.ndarray, packet_id: int,
+        packet_ros_stamp_ns: int, packet_monotonic_stamp_ns: int,
+        original_ros_stamp_ns: int, original_monotonic_stamp_ns: int,
+    ) -> "EventPacket":
+        """Reconstruct the live EVT1 row representation without changing data."""
+        event_type = np.asarray(event_type)
+        event_x = np.asarray(event_x)
+        event_y = np.asarray(event_y)
+        timestamps = np.asarray(timestamps_us, dtype=np.int64)
+        count = int(timestamps.size)
+        if not (event_type.size == event_x.size == event_y.size == count):
+            raise ValueError("recorded event columns have different lengths")
+        if count > MAX_EVENT_COUNT:
+            raise ValueError(
+                f"event_count must be in [0, {MAX_EVENT_COUNT}], got {count}")
+        if np.any(timestamps < 0):
+            raise ValueError("recorded sensor timestamps must be non-negative")
+
+        events = np.empty((count, EVENT_COLUMNS), dtype=np.uint16)
+        events[:, 0] = event_type
+        seconds, remainder = np.divmod(timestamps, 1_000_000)
+        milliseconds, microseconds = np.divmod(remainder, 1_000)
+        if np.any(seconds > np.iinfo(np.uint16).max):
+            raise ValueError("recorded sensor timestamp seconds exceed EVT1 uint16")
+        events[:, 1] = seconds
+        events[:, 2] = milliseconds
+        events[:, 3] = microseconds
+        events[:, 4] = event_x
+        events[:, 5] = event_y
+        first = int(timestamps.min()) if count else -1
+        last = int(timestamps.max()) if count else -1
+        return cls(
+            events=events, packet_id=int(packet_id), event_count=count,
+            payload_length=count * EVENT_BYTES,
+            packet_ros_stamp_ns=int(packet_ros_stamp_ns),
+            packet_monotonic_stamp_ns=int(packet_monotonic_stamp_ns),
+            timestamps_us=timestamps.copy(), first_event_timestamp_us=first,
+            last_event_timestamp_us=last, source="hdf5_replay",
+            original_ros_stamp_ns=int(original_ros_stamp_ns),
+            original_monotonic_stamp_ns=int(original_monotonic_stamp_ns),
         )

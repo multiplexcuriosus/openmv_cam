@@ -19,6 +19,19 @@ def generate_launch_description():
         "event_frame_mode",
         default_value="shifted",
     )
+    replay_defaults = {
+        "event_input_mode": "hardware",
+        "event_replay_path": "",
+        "event_replay_timing": "recorded",
+        "event_replay_rate": "1.0",
+        "event_replay_start_packet": "0",
+        "event_replay_end_packet": "-1",
+        "event_replay_loop": "false",
+    }
+    replay_args = [
+        DeclareLaunchArgument(name, default_value=default)
+        for name, default in replay_defaults.items()
+    ]
     event_frame_ch0_ms_arg = DeclareLaunchArgument(
         "event_frame_ch0_ms",
         default_value="50.0",
@@ -188,6 +201,19 @@ def generate_launch_description():
     openmv_params.update({
         name: LaunchConfiguration(name) for name in tracker_defaults
     })
+    openmv_params.update({
+        name: LaunchConfiguration(name) for name in replay_defaults
+    })
+
+    replay_log = LogInfo(msg=[
+        "OpenMV event input: mode=", LaunchConfiguration("event_input_mode"),
+        ", replay_path=", LaunchConfiguration("event_replay_path"),
+        ", timing=", LaunchConfiguration("event_replay_timing"),
+        ", rate=", LaunchConfiguration("event_replay_rate"),
+        ", packets=[", LaunchConfiguration("event_replay_start_packet"),
+        ",", LaunchConfiguration("event_replay_end_packet"),
+        "], loop=", LaunchConfiguration("event_replay_loop"),
+    ])
 
     xyt_log = LogInfo(msg=[
         "OpenMV XYT voxel: enabled=", LaunchConfiguration("publish_xyt_voxel"),
@@ -221,6 +247,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        *replay_args,
         event_frame_mode_arg,
         event_frame_ch0_ms_arg,
         event_frame_ch1_ms_arg,
@@ -248,5 +275,6 @@ def generate_launch_description():
         *tracker_args,
         xyt_log,
         activity_log,
+        replay_log,
         openmv_node,
     ])

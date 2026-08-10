@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import struct
 import threading
 import time
@@ -40,6 +41,7 @@ from .event_ball_tracker import (
     trace_detail_json,
 )
 from .evt1_protocol import EventPacket, MAX_EVENT_COUNT, reconstruct_timestamps_us
+from .hdf5_replay import HDF5ReplayReader, ReplayDiagnostics, replay_packets
 
 
 def build_hwc9_image_message(
@@ -153,6 +155,13 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("frame_id", "openmv_cam")
         self.declare_parameter("publish_fps", 30.0)
         self.declare_parameter("event_frame_rotation_degrees", 0)
+        self.declare_parameter("event_input_mode", "hardware")
+        self.declare_parameter("event_replay_path", "")
+        self.declare_parameter("event_replay_timing", "recorded")
+        self.declare_parameter("event_replay_rate", 1.0)
+        self.declare_parameter("event_replay_start_packet", 0)
+        self.declare_parameter("event_replay_end_packet", -1)
+        self.declare_parameter("event_replay_loop", False)
 
         # Raw-packet event ball tracker (native, unrotated OpenMV coordinates).
         self.declare_parameter("event_tracker_enabled", False)
@@ -416,6 +425,20 @@ class OpenMVEventCamNode(Node):
         self.step = self.get_parameter("step").get_parameter_value().double_value
         self.blur_kernel = self.get_parameter("blur_kernel").get_parameter_value().integer_value
         self.sort_by_timestamp = self.get_parameter("sort_by_timestamp").get_parameter_value().bool_value
+        self.event_input_mode = str(self.get_parameter("event_input_mode").value).strip().lower()
+        self.event_replay_path = str(self.get_parameter("event_replay_path").value).strip()
+        self.event_replay_timing = str(
+            self.get_parameter("event_replay_timing").value).strip().lower()
+        self.event_replay_rate = float(self.get_parameter("event_replay_rate").value)
+        self.event_replay_start_packet = int(self.get_parameter("event_replay_start_packet").value)
+        self.event_replay_end_packet = int(self.get_parameter("event_replay_end_packet").value)
+        self.event_replay_loop = bool(self.get_parameter("event_replay_loop").value)
+        if self.event_input_mode not in ("hardware", "hdf5_replay"):
+            raise ValueError("event_input_mode must be 'hardware' or 'hdf5_replay'")
+        if self.event_replay_timing not in ("recorded", "sensor", "fast"):
+            raise ValueError("event_replay_timing must be 'recorded', 'sensor', or 'fast'")
+        if not np.isfinite(self.event_replay_rate) or self.event_replay_rate <= 0.0:
+            raise ValueError("event_replay_rate must be positive and finite")
 
         configured_topics = [
             self.topic,
@@ -537,12 +560,21 @@ class OpenMVEventCamNode(Node):
         self._diagnostic_last_events = 0
         self._diagnostic_last_messages = 0
 
-        self.serial_port = None
-        self._open_serial()
-
         self._stop_event = threading.Event()
         self._preview_lock = threading.Lock()
         self._h5_lock = threading.Lock()
+        self.serial_port = None
+        self._replay_reader = None
+        self._replay_diagnostics = ReplayDiagnostics()
+        if self.event_input_mode == "hardware":
+            self._open_serial()
+        else:
+            if not self.event_replay_path:
+                raise ValueError("event_replay_path is required in hdf5_replay mode")
+            self._replay_reader = HDF5ReplayReader(
+                self.event_replay_path,
+                start_packet=self.event_replay_start_packet,
+                end_packet=self.event_replay_end_packet)
 
         # Stores tuples: (host_arrival_time_monotonic, validated EventPacket).
         self.preview_buffer = deque()
@@ -573,7 +605,9 @@ class OpenMVEventCamNode(Node):
         self.t0 = time.monotonic()
         self.last_stats_print = self.t0
 
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        worker = (self._reader_loop if self.event_input_mode == "hardware"
+                  else self._replay_loop)
+        self._reader_thread = threading.Thread(target=worker, daemon=True)
         self._reader_thread.start()
 
         self._start_pub_srv = self.create_service(
@@ -612,7 +646,19 @@ class OpenMVEventCamNode(Node):
             self._handle_stop_raw_event_recording,
         )
 
-        self.get_logger().info(f"Serial port opened: {self.port_name} @ {self.baud}")
+        self.get_logger().info(
+            "Event input configuration: "
+            f"mode={self.event_input_mode}, replay_path={self.event_replay_path!r}, "
+            f"replay_timing={self.event_replay_timing}, rate={self.event_replay_rate}, "
+            f"packet_range=[{self.event_replay_start_packet},"
+            f"{self.event_replay_end_packet}], loop={self.event_replay_loop}")
+        if self.event_input_mode == "hardware":
+            self.get_logger().info(f"Serial port opened: {self.port_name} @ {self.baud}")
+        else:
+            self.get_logger().info(
+                f"HDF5 replay opened read-only: {self._replay_reader.path}; "
+                f"selected_range=[{self._replay_reader.start_packet},"
+                f"{self._replay_reader.end_packet}]")
         self.get_logger().info("Event frame publishing initially disabled")
         self.get_logger().info(f"Mono event image topic: {self.topic} encoding=mono8")
         self.get_logger().info(
@@ -1329,6 +1375,20 @@ class OpenMVEventCamNode(Node):
         if self.event_tracker is None:
             return
         start_ros_ns = int(self.get_clock().now().nanoseconds)
+        trace_detail = {
+            "source": packet.source,
+            "packet_index": int(packet.packet_id),
+            "sensor_timestamp_domain": "genx320_microseconds",
+            "first_event_timestamp_us": int(packet.first_event_timestamp_us),
+            "last_event_timestamp_us": int(packet.last_event_timestamp_us),
+            "event_count": int(packet.event_count),
+        }
+        if packet.source == "hdf5_replay":
+            trace_detail.update({
+                "original_recorded_ros_t_ns": int(packet.original_ros_stamp_ns),
+                "original_recorded_monotonic_t_ns": int(
+                    packet.original_monotonic_stamp_ns),
+            })
         self._publish_tracker_trace(
             event="input", sequence=packet.packet_id, parent_sequence=0,
             source_stamp_ns=packet.packet_ros_stamp_ns,
@@ -1338,11 +1398,7 @@ class OpenMVEventCamNode(Node):
             end_steady_ns=packet.packet_monotonic_stamp_ns,
             valid=packet.event_count > 0,
             scalar_value=float(packet.event_count),
-            detail_json=(
-                '{"sensor_timestamp_domain":"genx320_microseconds",'
-                f'"first_event_timestamp_us":{packet.first_event_timestamp_us},'
-                f'"last_event_timestamp_us":{packet.last_event_timestamp_us},'
-                f'"event_count":{packet.event_count}' + '}'))
+            detail_json=json.dumps(trace_detail, allow_nan=False, separators=(",", ":")))
         detections = self.event_tracker.update(packet)
         for detection in detections:
             self._tracker_trace_sequence += 1
@@ -1374,7 +1430,18 @@ class OpenMVEventCamNode(Node):
                 start_steady_ns=detection.start_steady_ns,
                 end_steady_ns=detection.end_steady_ns, valid=detection.valid,
                 scalar_value=detection.confidence,
-                detail_json=trace_detail_json(detection))
+                detail_json=self._tracker_completion_detail(packet, detection))
+
+    @staticmethod
+    def _tracker_completion_detail(packet, detection):
+        detail = json.loads(trace_detail_json(detection))
+        detail["source"] = packet.source
+        detail["packet_index"] = int(packet.packet_id)
+        if packet.source == "hdf5_replay":
+            detail["original_recorded_ros_t_ns"] = int(packet.original_ros_stamp_ns)
+            detail["original_recorded_monotonic_t_ns"] = int(
+                packet.original_monotonic_stamp_ns)
+        return json.dumps(detail, allow_nan=False, separators=(",", ":"))
 
     def _event_tracker_stats_cb(self):
         stats = self.event_tracker.statistics()
@@ -1445,69 +1512,107 @@ class OpenMVEventCamNode(Node):
                 packet_ros_t_ns = int(self.get_clock().now().nanoseconds)
                 packet_mono_t_ns = int(time.monotonic_ns())
 
-                now = time.monotonic()
-                self.total_packets += 1
-                packet_id = int(self.total_packets)
+                packet_id = int(self.total_packets + 1)
                 packet = EventPacket.decode(
                     payload, event_count=event_count, payload_length=payload_len,
                     packet_id=packet_id, packet_ros_stamp_ns=packet_ros_t_ns,
                     packet_monotonic_stamp_ns=packet_mono_t_ns)
-                events = packet.events
-                self.total_events += event_count
-                self.total_payload_bytes += payload_len
-                self.total_protocol_bytes += payload_len + self.HEADER_SIZE
-
-                if self.total_packets <= 3 and event_count > 0:
-                    self.get_logger().info(
-                        f"packet {self.total_packets}: "
-                        f"type={np.unique(events[:, 0])[:10]}, "
-                        f"x=[{int(events[:, 4].min())},{int(events[:, 4].max())}], "
-                        f"y=[{int(events[:, 5].min())},{int(events[:, 5].max())}]"
-                    )
-
-
-
-                if self._recording_enabled:
-                    self._append_packet_to_h5(packet)
-
-                self._handle_tracker_packet(packet)
-
-                if self._publishing_enabled:
-                    with self._preview_lock:
-                        self.preview_buffer.append((now, packet))
-                        if event_count > 0:
-                            self._event_data_generation += 1
-                        self._trim_preview_buffer_locked(now)
-
-                if now - self.last_stats_print >= 2.0:
-                    elapsed = now - self.t0
-                    packets_per_s = self.total_packets / elapsed if elapsed > 0 else 0.0
-                    events_per_s = self.total_events / elapsed if elapsed > 0 else 0.0
-                    payload_MBps = self.total_payload_bytes / elapsed / 1e6 if elapsed > 0 else 0.0
-                    protocol_MBps = self.total_protocol_bytes / elapsed / 1e6 if elapsed > 0 else 0.0
-
-                    if self.print_log:
-                        self.get_logger().info(
-                            "EVENT STREAM STATS | "
-                            f"packets={self.total_packets}, "
-                            f"events={self.total_events}, "
-                            f"elapsed={elapsed:.2f}s, "
-                            f"packets/s={packets_per_s:.1f}, "
-                            f"events/s={events_per_s:.1f}, "
-                            f"payload_MBps={payload_MBps:.3f}, "
-                            f"protocol_MBps={protocol_MBps:.3f}"
-                        )
-                    self.last_stats_print = now
+                self._process_packet(packet)
 
             except RuntimeError as e:
                 if "Stop requested" in str(e):
                     break
                 self.get_logger().warn(f"Event read failed: {e}")
-                time.sleep(0.05)
+                self._stop_event.wait(0.05)
 
             except Exception as e:
                 self.get_logger().warn(f"Unexpected error in reader loop: {e}")
-                time.sleep(0.05)
+                self._stop_event.wait(0.05)
+
+    def _process_packet(self, packet: EventPacket):
+        """Drive every downstream consumer for hardware and replay packets."""
+        if self._stop_event.is_set():
+            return
+        now = time.monotonic()
+        self.total_packets += 1
+        self.total_events += packet.event_count
+        self.total_payload_bytes += packet.payload_length
+        self.total_protocol_bytes += packet.payload_length + self.HEADER_SIZE
+        if self.total_packets <= 3 and packet.event_count > 0:
+            events = packet.events
+            self.get_logger().info(
+                f"{packet.source} packet {packet.packet_id}: "
+                f"type={np.unique(events[:, 0])[:10]}, "
+                f"x=[{int(events[:, 4].min())},{int(events[:, 4].max())}], "
+                f"y=[{int(events[:, 5].min())},{int(events[:, 5].max())}]")
+        if self._recording_enabled:
+            self._append_packet_to_h5(packet)
+        self._handle_tracker_packet(packet)
+        if self._publishing_enabled and not self._stop_event.is_set():
+            with self._preview_lock:
+                self.preview_buffer.append((now, packet))
+                if packet.event_count > 0:
+                    self._event_data_generation += 1
+                self._trim_preview_buffer_locked(now)
+        if now - self.last_stats_print >= 2.0:
+            elapsed = max(now - self.t0, 1e-9)
+            if self.print_log:
+                self.get_logger().info(
+                    "EVENT STREAM STATS | "
+                    f"source={packet.source}, packets={self.total_packets}, "
+                    f"events={self.total_events}, elapsed={elapsed:.2f}s, "
+                    f"packet_rate_hz={self.total_packets / elapsed:.1f}, "
+                    f"event_rate_hz={self.total_events / elapsed:.1f}, "
+                    f"payload_MBps={self.total_payload_bytes / elapsed / 1e6:.3f}, "
+                    f"protocol_MBps={self.total_protocol_bytes / elapsed / 1e6:.3f}")
+            self.last_stats_print = now
+
+    def _replay_loop(self):
+        replay_started_ns = time.monotonic_ns()
+        try:
+            replay_packets(
+                self._replay_reader, timing=self.event_replay_timing,
+                rate=self.event_replay_rate, loop=self.event_replay_loop,
+                stop_event=self._stop_event, process_packet=self._process_packet,
+                ros_now_ns=lambda: int(self.get_clock().now().nanoseconds),
+                monotonic_now_ns=time.monotonic_ns,
+                diagnostics=self._replay_diagnostics,
+                warn=self.get_logger().warn)
+            d = self._replay_diagnostics
+            elapsed_s = max((time.monotonic_ns() - replay_started_ns) / 1e9, 1e-9)
+            actual_packet_rate = d.replay_packets_processed / elapsed_s
+            event_rate = d.replay_events_processed / elapsed_s
+            recorded_packet_rate = 0.0
+            if d.replay_packets_processed > 1:
+                try:
+                    first = self._replay_reader.packet_timing_value(
+                        self._replay_reader.start_packet, "recorded")
+                    last = self._replay_reader.packet_timing_value(
+                        self._replay_reader.end_packet, "recorded")
+                    span_s = (last - first) / 1e9
+                    if first >= 0 and span_s > 0.0:
+                        selected_count = (self._replay_reader.end_packet -
+                                          self._replay_reader.start_packet + 1)
+                        recorded_packet_rate = (selected_count - 1) / span_s
+                except (ValueError, KeyError):
+                    pass
+            self.get_logger().info(
+                "HDF5 REPLAY COMPLETE | "
+                f"replay_packets_read={d.replay_packets_read}, "
+                f"replay_packets_processed={d.replay_packets_processed}, "
+                f"replay_events_processed={d.replay_events_processed}, "
+                f"replay_packets_skipped={d.replay_packets_skipped}, "
+                f"replay_loops_completed={d.replay_loops_completed}, "
+                f"replay_timing_fallbacks={d.replay_timing_fallbacks}, "
+                f"recorded_packet_rate_hz={recorded_packet_rate:.2f}, "
+                f"actual_replay_packet_rate_hz={actual_packet_rate:.2f}, "
+                f"event_rate_hz={event_rate:.1f}")
+        except Exception as error:
+            if not self._stop_event.is_set():
+                self.get_logger().error(f"HDF5 replay failed: {error}")
+        finally:
+            if self._replay_reader is not None:
+                self._replay_reader.close()
 
     def _publish_timer_cb(self):
         if not self._publishing_enabled:
@@ -1837,8 +1942,14 @@ class OpenMVEventCamNode(Node):
         with self._preview_lock:
             self.preview_buffer.clear()
 
+        worker_alive = False
         if hasattr(self, "_reader_thread") and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=2.0)
+            worker_alive = self._reader_thread.is_alive()
+        if self._replay_reader is not None and not worker_alive:
+            self._replay_reader.close()
+        if worker_alive:
+            self.get_logger().warn("Input worker did not stop within 2 seconds")
 
         with self._h5_lock:
             if self._recording_enabled:
@@ -1854,7 +1965,10 @@ class OpenMVEventCamNode(Node):
             except Exception:
                 pass
 
-        self.get_logger().info("Serial port closed")
+        if self.event_input_mode == "hardware":
+            self.get_logger().info("Serial port closed")
+        else:
+            self.get_logger().info("HDF5 replay input closed")
 
         super().destroy_node()
 

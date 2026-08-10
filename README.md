@@ -1,5 +1,122 @@
 # OpenMV event camera ROS node
 
+## Hardware and raw-event HDF5 replay
+
+`openmv_cam` accepts interchangeable raw packet sources. The default remains
+the physical GenX320 EVT1 serial stream:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py event_input_mode:=hardware
+```
+
+Recorded sessions can instead enter the identical `EventPacket` processing
+path. Replay does not open `/dev/openmvcam`, and hardware mode does not open an
+HDF5 input file:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py \
+  event_input_mode:=hdf5_replay \
+  event_replay_path:=/home/jau/data/bags/example/example_raw_events.h5 \
+  event_replay_timing:=recorded \
+  event_replay_rate:=1.0 \
+  event_replay_loop:=false \
+  event_tracker_enabled:=true \
+  event_tracker_debug_enabled:=true \
+  event_tracker_debug_clip_count:=2 \
+  event_tracker_activity_threshold:=1 \
+  event_tracker_min_event_count:=1 \
+  event_tracker_min_blob_area_px:=500 \
+  event_tracker_max_blob_area_px:=1500 \
+  event_tracker_max_jump_px:=100.0 \
+  event_tracker_velocity_history_size:=4 \
+  event_tracker_velocity_min_span_ms:=1.0 \
+  event_tracker_bin_ms:=10.0 \
+  event_tracker_morphology_operation:=dilate \
+  event_tracker_morphology_kernel:=7 \
+  event_tracker_morphology_iterations:=3
+```
+
+Replay parameters and defaults are:
+
+- `event_input_mode=hardware`: `hardware` or `hdf5_replay`.
+- `event_replay_path=""`: input file required for replay.
+- `event_replay_timing=recorded`: `recorded`, `sensor`, or `fast`.
+- `event_replay_rate=1.0`: positive finite timing multiplier; `2.0` is twice
+  real time and `0.5` is half speed.
+- `event_replay_start_packet=0`: first packet index, inclusive.
+- `event_replay_end_packet=-1`: final packet index, inclusive; `-1` selects the
+  end of the recording.
+- `event_replay_loop=false`: restart at the selected first packet after EOF.
+
+The raw recorder and replay reader use this schema (all datasets are 1-D):
+
+```text
+/events/type       uint8
+/events/x          uint16
+/events/y          uint16
+/events/t_us       int64
+/events/packet_id  int64
+/packets/ros_t_ns             int64
+/packets/monotonic_t_ns       int64
+/packets/start_event_idx      int64
+/packets/end_event_idx        int64
+/packets/event_count          int64
+/packets/first_event_t_us     int64
+/packets/last_event_t_us      int64
+```
+
+The packet boundary is the half-open event range
+`[start_event_idx, end_event_idx)`. The replay validator requires the five
+event datasets and the first five packet datasets shown above, checks their
+dtypes, lengths, contiguous boundaries, counts, and `packet_id` membership.
+The final two packet timestamp-bound datasets are recorder metadata; replay
+derives sensor pacing directly from `/events/t_us`, allowing compatible older
+files without those two columns. Events are read packet-wise rather than
+loading the stream into RAM.
+
+Timing modes have the following semantics:
+
+- `recorded` schedules packet arrivals from recorded monotonic host timestamps.
+  ROS epoch timestamps are never used for sleeps.
+- `sensor` schedules from the minimum GenX320 timestamp in each packet. Tracker
+  timing and velocity continue to use the unchanged sensor timestamps.
+- `fast` performs no intentional sleep and is suitable for parameter sweeps.
+
+Recorded and sensor delays are divided by `event_replay_rate` and scheduled
+against the current host monotonic clock. A missing, zero, reset, or
+non-monotonic pacing timestamp produces one clear warning and switches the
+remainder of replay to `fast`; an empty packet therefore causes sensor timing
+to fall back. Loop timing is re-anchored on each selected range. All waits are
+interruptible during node shutdown.
+
+New ROS messages always use current replay-time ROS timestamps, and host
+measurements use current monotonic time. Original ROS/monotonic timestamps are
+retained only in replay `EventPacket` metadata and finite latency-trace JSON.
+GenX320 timestamps, event order, polarity, coordinates, packet boundaries, and
+recorded packet indices are preserved. Tracker debug images and all event image
+and voxel publishers consume the same shared packet buffer as hardware input.
+Latency tracing emits the existing input/completion contract with
+`source=hdf5_replay`, packet index, and original recorded timestamps in
+`detail_json`.
+
+Raw recording services remain unchanged. They may record replayed packets into
+the same schema while preserving event timestamps and packet boundaries; the
+new file records the current replay arrival clocks in its packet metadata.
+
+Useful variants are:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py event_input_mode:=hdf5_replay \
+  event_replay_path:=/data/events.h5 event_replay_timing:=fast
+
+ros2 launch openmv_cam openmv.launch.py event_input_mode:=hdf5_replay \
+  event_replay_path:=/data/events.h5 event_replay_timing:=sensor
+
+ros2 launch openmv_cam openmv.launch.py event_input_mode:=hdf5_replay \
+  event_replay_path:=/data/events.h5 event_replay_timing:=recorded \
+  event_replay_rate:=2.0
+```
+
 ## Raw-packet event ball tracker MVP
 
 The optional event tracker detects a high-activity ball-like blob directly in

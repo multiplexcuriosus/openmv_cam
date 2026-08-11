@@ -1,5 +1,55 @@
 # OpenMV event camera ROS node
 
+## Offline sparse-tracking datasets (no ROS required)
+
+`openmv_cam.offline_dataset` streams packet slices from a raw-event HDF5,
+reconstructs the existing `EventPacket` representation, and invokes the
+unchanged `EventBallTracker`. The two-stage design makes the tracker sidecar
+reusable for more than one enrichment pass. Tracker state is reset at every
+episode boundary, and packets are assigned from their ROS timestamps and the
+episode intervals, never from file ordering. `--pre-roll-ms` optionally warms
+up a new tracker; detections made before the episode start are discarded.
+
+For a 100-episode recording, run:
+
+```bash
+python3 -m openmv_cam.offline_dataset build \
+  --raw-events /data/run/run_raw_events.h5 \
+  --episodes /data/run/hdf5_dataset \
+  --output /data/run/hdf5_dataset_sparse \
+  --tracker-config config/offline_tracker_example.json \
+  --tracker-output /data/run/tracker_outputs.h5 \
+  --overwrite
+```
+
+The raw input schema is `/events/{type,x,y,t_us}` and
+`/packets/{ros_t_ns,start_event_idx,end_event_idx}`, with optional
+`monotonic_t_ns` and `packet_id`. Packet event ranges are half-open. Sensor
+dimensions come from `width`/`height` root or `/events` attributes and default
+to 320x320. Only one event packet is read at a time.
+
+The sidecar stores metadata in `/metadata` attributes and one extendable row
+per tracker update beneath `/episodes/episode_N`. In particular,
+`available_ros_t_ns` is packet ROS time, while `sensor_window_start_us` and
+`sensor_window_end_us` remain GENX320 sensor time. These domains must not be
+interchanged.
+
+Enriched copies preserve the complete source file and add
+`/observations/sparse_tracking`. Every dataset has the same leading dimension
+as `/observations/timestamps`. Sampling selects the latest update available at
+or before each observation, so it is causal. The group contains event position,
+velocity, validity/update flags, source time and age, sensor window bounds,
+event/blob diagnostics, confidence, and rejection reason. Missing initial
+updates use zero coordinates, false flags, and NaN source time/age. Original
+files are never changed; each output is copied to a temporary sibling and
+atomically renamed.
+
+RGB 2D data is deliberately optional. `--rgb-tracks-dir` accepts one HDF5 per
+episode containing `timestamps`, `rgb_2d_px`, and `valid`, sampled with the same
+causal rule. Without it, event-only output is written with a warning. Use
+`--write-empty-rgb-track` to explicitly add zero-filled RGB fields, or
+`--require-rgb-2d` to fail when an episode track is absent.
+
 ## Hardware and raw-event HDF5 replay
 
 `openmv_cam` accepts interchangeable raw packet sources. The default remains

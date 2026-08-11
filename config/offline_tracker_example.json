@@ -1,0 +1,21 @@
+{
+  "width": 320,
+  "height": 320,
+  "bin_ms": 1.0,
+  "accumulation_window_ms": 3.0,
+  "activity_threshold": 1,
+  "min_event_count": 1,
+  "min_blob_area_px": 250,
+  "max_blob_area_px": 1500,
+  "max_jump_px": 100.0,
+  "velocity_history_size": 4,
+  "velocity_min_span_ms": 1.0,
+  "morphology_operation": "dilate",
+  "morphology_kernel": 3,
+  "morphology_iterations": 3,
+  "spatial_filter_enabled": false,
+  "spatial_filter_min_neighbors": 8,
+  "spatial_filter_min_component_area_px": 10,
+  "x_crop": [100, 210],
+  "y_crop": [70, 275, 115, 235]
+}

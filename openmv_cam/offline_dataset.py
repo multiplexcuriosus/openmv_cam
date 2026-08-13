@@ -1,6 +1,7 @@
 """Build causal event-tracking datasets without ROS."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -19,7 +20,8 @@ from .evt1_protocol import EventPacket
 from .offline_raw_events import RawEventHDF5Reader
 
 
-SCHEMA_VERSION = "sparse_tracking_v1"
+SCHEMA_VERSION = "sparse_tracking_v2"
+TRACKER_SCHEMA_VERSION = "event_tracker_updates_v2"
 STRING_DTYPE = h5py.string_dtype("utf-8", length=256)
 TRACKER_FIELDS = {
     "available_ros_t_ns": "i8", "packet_id": "i8",
@@ -45,6 +47,196 @@ class Episode:
     start: float
     end: float
     timestamps: np.ndarray
+
+
+@dataclass(frozen=True)
+class TrackerUpdate:
+    """One native tracker update with explicit availability and sensor times."""
+
+    episode_name: str
+    episode_index: int
+    source_episode_index: int
+    available_ros_t_ns: int
+    packet_id: int
+    sensor_window_start_us: int
+    sensor_window_end_us: int
+    x_px: float
+    y_px: float
+    vx_px_s: float
+    vy_px_s: float
+    speed_px_s: float
+    confidence: float
+    valid: bool
+    velocity_valid: bool
+    window_event_count: int
+    candidate_count: int
+    blob_area_px: int
+    blob_event_count: int
+    blob_width_px: int
+    blob_height_px: int
+    circularity: float
+    rejection_reason: str
+
+
+def _config_dict(config):
+    if isinstance(config, (str, os.PathLike)):
+        return load_tracker_config(config)
+    config = dict(config)
+    try:
+        EventBallTracker(**config)
+    except TypeError as error:
+        raise ValueError(f"invalid tracker configuration: {error}") from error
+    return config
+
+
+def _event_packet(recorded):
+    return EventPacket.from_recorded_arrays(
+        event_type=recorded.event_type, event_x=recorded.event_x,
+        event_y=recorded.event_y, timestamps_us=recorded.event_t_us,
+        packet_id=recorded.packet_id,
+        packet_ros_stamp_ns=recorded.packet_ros_t_ns,
+        packet_monotonic_stamp_ns=recorded.packet_monotonic_t_ns,
+        original_ros_stamp_ns=recorded.packet_ros_t_ns,
+        original_monotonic_stamp_ns=recorded.packet_monotonic_t_ns)
+
+
+def _tracker_update(episode, recorded, detection):
+    return TrackerUpdate(
+        episode.name, episode.episode_index, episode.source_episode_index,
+        int(recorded.packet_ros_t_ns), int(recorded.packet_id),
+        int(detection.window_start_us), int(detection.window_end_us),
+        float(detection.x_px), float(detection.y_px),
+        float(detection.vx_px_s), float(detection.vy_px_s),
+        float(detection.speed_px_s), float(detection.confidence),
+        bool(detection.valid), bool(detection.velocity_valid),
+        int(detection.window_event_count), int(detection.candidate_count),
+        int(detection.blob_area_px), int(detection.blob_event_count),
+        int(detection.blob_width_px), int(detection.blob_height_px),
+        float(detection.circularity), str(detection.rejection_reason))
+
+
+def stream_tracker_updates(raw_events, episodes, tracker_config, *, pre_roll_ms=0.0):
+    """Yield every update, in episode order, while streaming raw packets."""
+    if pre_roll_ms < 0:
+        raise ValueError("pre_roll_ms must be non-negative")
+    episodes = (discover_episodes(episodes) if isinstance(episodes, (str, os.PathLike))
+                else list(episodes))
+    config = _config_dict(tracker_config)
+    with RawEventHDF5Reader(
+            raw_events, width=config.get("width"), height=config.get("height")) as reader:
+        for episode in episodes:
+            tracker = tracker_factory(config)
+            start_ns = int(round((episode.start - pre_roll_ms / 1000.0) * 1e9))
+            episode_start_ns = int(round(episode.start * 1e9))
+            end_ns = int(round(episode.end * 1e9))
+            for recorded in reader.iter_packets(start_ros_t_ns=start_ns,
+                                                end_ros_t_ns=end_ns):
+                detections = tracker.update(_event_packet(recorded))
+                if recorded.packet_ros_t_ns < episode_start_ns:
+                    continue
+                for detection in detections:
+                    yield _tracker_update(episode, recorded, detection)
+
+
+def run_tracker_updates(raw_events, episodes, tracker_config, *, pre_roll_ms=0.0):
+    """Return native updates grouped by episode; each episode uses a fresh tracker."""
+    episode_list = (discover_episodes(episodes)
+                    if isinstance(episodes, (str, os.PathLike)) else list(episodes))
+    result = {episode.name: [] for episode in episode_list}
+    for update in stream_tracker_updates(
+            raw_events, episode_list, tracker_config, pre_roll_ms=pre_roll_ms):
+        result[update.episode_name].append(update)
+    return result
+
+
+def align_tracker_updates_to_policy_grid(updates, policy_timestamps_ns,
+                                         max_observation_age_sec=np.inf):
+    """Causally align update diagnostics and the independently held valid signal."""
+    raw_policy_ns = np.asarray(policy_timestamps_ns)
+    if not np.issubdtype(raw_policy_ns.dtype, np.integer):
+        raise TypeError("policy_timestamps_ns must contain integer nanoseconds")
+    policy_ns = raw_policy_ns.astype(np.int64, copy=False)
+    if policy_ns.ndim != 1:
+        raise ValueError("policy_timestamps_ns must be one-dimensional")
+    max_age = float(max_observation_age_sec)
+    if max_age < 0 or np.isnan(max_age):
+        raise ValueError("max_observation_age_sec must be non-negative")
+    max_age_ns = (np.iinfo(np.int64).max if np.isinf(max_age) else
+                  int(round(max_age * 1e9)))
+    rows = list(updates)
+    # Stable sorting makes the last input update win for duplicate availability times.
+    rows.sort(key=lambda row: row.available_ros_t_ns)
+    available = np.asarray([row.available_ros_t_ns for row in rows], dtype=np.int64)
+    latest = np.searchsorted(available, policy_ns, side="right") - 1
+    has = latest >= 0
+    valid_rows = [row for row in rows if row.valid]
+    valid_available = np.asarray(
+        [row.available_ros_t_ns for row in valid_rows], dtype=np.int64)
+    latest_valid = np.searchsorted(valid_available, policy_ns, side="right") - 1
+    has_valid = latest_valid >= 0
+    source_ns = np.full(len(policy_ns), -1, dtype=np.int64)
+    points = np.zeros((len(policy_ns), 2), dtype=np.float32)
+    velocity = np.zeros((len(policy_ns), 2), dtype=np.float32)
+    velocity_valid = np.zeros(len(policy_ns), dtype=np.uint8)
+    sensor_start = np.full(len(policy_ns), -1, dtype=np.int64)
+    sensor_end = np.full(len(policy_ns), -1, dtype=np.int64)
+    packet_id = np.full(len(policy_ns), -1, dtype=np.int64)
+    window_events = np.zeros(len(policy_ns), dtype=np.int32)
+    candidates = np.zeros(len(policy_ns), dtype=np.int32)
+    blob_area = np.zeros(len(policy_ns), dtype=np.int32)
+    confidence = np.zeros(len(policy_ns), dtype=np.float32)
+    if np.any(has_valid):
+        positions = np.flatnonzero(has_valid)
+        selected = [valid_rows[latest_valid[index]] for index in positions]
+        source_ns[positions] = [row.available_ros_t_ns for row in selected]
+        points[positions] = [(row.x_px, row.y_px) for row in selected]
+        velocity[positions] = [(row.vx_px_s, row.vy_px_s) for row in selected]
+        velocity_valid[positions] = [row.velocity_valid for row in selected]
+        sensor_start[positions] = [row.sensor_window_start_us for row in selected]
+        sensor_end[positions] = [row.sensor_window_end_us for row in selected]
+        packet_id[positions] = [row.packet_id for row in selected]
+        window_events[positions] = [row.window_event_count for row in selected]
+        candidates[positions] = [row.candidate_count for row in selected]
+        blob_area[positions] = [row.blob_area_px for row in selected]
+        confidence[positions] = [row.confidence for row in selected]
+    age_ns = np.zeros(len(policy_ns), dtype=np.int64)
+    age_ns[has_valid] = policy_ns[has_valid] - source_ns[has_valid]
+    fresh = has_valid & (age_ns <= max_age_ns)
+    age_sec = np.full(len(policy_ns), np.nan, dtype=np.float64)
+    age_sec[has_valid] = age_ns[has_valid].astype(np.float64) / 1e9
+    latest_timestamp = np.full(len(policy_ns), -1, dtype=np.int64)
+    latest_is_valid = np.zeros(len(policy_ns), dtype=np.uint8)
+    reasons = np.full(len(policy_ns), "", dtype=object)
+    if np.any(has):
+        positions = np.flatnonzero(has)
+        selected = [rows[latest[index]] for index in positions]
+        latest_timestamp[positions] = [row.available_ros_t_ns for row in selected]
+        latest_is_valid[positions] = [row.valid for row in selected]
+        reasons[positions] = [row.rejection_reason for row in selected]
+    return {
+        "event_2d_px": points,
+        "event_velocity_px_s": velocity,
+        "event_valid": fresh.astype(np.uint8),
+        "event_velocity_valid": velocity_valid,
+        "event_source_timestamps_ns": source_ns,
+        "event_source_timestamps": np.where(
+            has_valid, source_ns.astype(np.float64) / 1e9, np.nan),
+        "event_source_age_sec": age_sec,
+        "event_source_packet_id": packet_id,
+        "event_sensor_window_start_us": sensor_start,
+        "event_sensor_window_end_us": sensor_end,
+        "event_window_event_count": window_events,
+        "event_candidate_count": candidates,
+        "event_blob_area_px": blob_area,
+        "event_confidence": confidence,
+        "event_has_update": has.astype(np.uint8),
+        "event_latest_update_valid": latest_is_valid,
+        "event_latest_update_timestamp_ns": latest_timestamp,
+        "event_latest_rejection_reason": reasons,
+        # Backward-compatible name; explicitly describes the latest update,
+        # not the independently held model-facing valid detection.
+        "event_rejection_reason": reasons.copy(),
+    }
 
 
 def discover_episodes(directory):
@@ -139,7 +331,8 @@ def _append(datasets, packet, detection):
 def run_tracker(raw_events, episodes_dir, output, tracker_config, *, pre_roll_ms=0.0):
     """Run a fresh tracker for each timestamp-defined episode."""
     episodes = discover_episodes(episodes_dir)
-    config = load_tracker_config(tracker_config)
+    config = _config_dict(tracker_config)
+    config_json = json.dumps(config, sort_keys=True, separators=(",", ":"))
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -151,12 +344,14 @@ def run_tracker(raw_events, episodes_dir, output, tracker_config, *, pre_roll_ms
             metadata = sidecar.create_group("metadata")
             metadata.attrs.update({
                 "raw_events_h5": str(Path(raw_events).resolve()),
-                "tracker_config_json": json.dumps(config, sort_keys=True),
-                "tracker_code_version": "EventBallTracker/offline_dataset_v1",
+                "tracker_config_json": config_json,
+                "tracker_config_hash": hashlib.sha256(config_json.encode()).hexdigest(),
+                "tracker_code_version": "EventBallTracker/offline_dataset_v2",
                 "sensor_width": reader.width, "sensor_height": reader.height,
                 "availability_timestamp_domain": "packet_ros_t_ns",
                 "sensor_timestamp_domain": "genx320_microseconds",
                 "pre_roll_ms": float(pre_roll_ms),
+                "schema_version": TRACKER_SCHEMA_VERSION,
             })
             groups = sidecar.create_group("episodes")
             for number, episode in enumerate(episodes, 1):
@@ -231,47 +426,60 @@ def _read_rgb_track(directory, episode):
     return timestamps, points, valid
 
 
-def _sample_sidecar(group, timestamps):
-    available = np.asarray(group["available_ros_t_ns"][:], dtype=np.int64)
-    sample_ns = np.rint(timestamps * 1e9).astype(np.int64)
-    indices = np.searchsorted(available, sample_ns, side="right") - 1
-    has = indices >= 0
-    safe = np.maximum(indices, 0)
+def _sidecar_updates(group, episode):
+    columns = {name: np.asarray(group[name][:]) for name in TRACKER_FIELDS}
+    reasons = group["rejection_reason"].asstr()[:]
+    updates = []
+    for index in range(len(columns["available_ros_t_ns"])):
+        updates.append(TrackerUpdate(
+            episode.name, episode.episode_index, episode.source_episode_index,
+            int(columns["available_ros_t_ns"][index]), int(columns["packet_id"][index]),
+            int(columns["sensor_window_start_us"][index]),
+            int(columns["sensor_window_end_us"][index]),
+            float(columns["x_px"][index]), float(columns["y_px"][index]),
+            float(columns["vx_px_s"][index]), float(columns["vy_px_s"][index]),
+            float(columns["speed_px_s"][index]), float(columns["confidence"][index]),
+            bool(columns["valid"][index]), bool(columns["velocity_valid"][index]),
+            int(columns["window_event_count"][index]),
+            int(columns["candidate_count"][index]), int(columns["blob_area_px"][index]),
+            int(columns["blob_event_count"][index]), int(columns["blob_width_px"][index]),
+            int(columns["blob_height_px"][index]), float(columns["circularity"][index]),
+            str(reasons[index])))
+    return updates
 
-    def take(name, dtype, fill=0):
-        result = np.full(len(timestamps), fill, dtype=dtype)
-        if np.any(has):
-            # h5py fancy indexing rejects repeated indices. Tracker outputs are
-            # compact sidecar rows (not raw events), so read this one column and
-            # let NumPy perform the repeated causal selection.
-            result[has] = np.asarray(group[name][:])[safe[has]]
-        return result
-    output = {
-        "event_2d_px": np.column_stack((take("x_px", "f4"), take("y_px", "f4"))),
-        "event_velocity_px_s": np.column_stack(
-            (take("vx_px_s", "f4"), take("vy_px_s", "f4"))),
-        "event_valid": take("valid", "u1"),
-        "event_velocity_valid": take("velocity_valid", "u1"),
-        "event_has_update": has.astype("u1"),
-        "event_source_timestamps": np.full(len(timestamps), np.nan, dtype="f8"),
-        "event_source_age_sec": np.full(len(timestamps), np.nan, dtype="f4"),
-        "event_sensor_window_start_us": take("sensor_window_start_us", "i8", -1),
-        "event_sensor_window_end_us": take("sensor_window_end_us", "i8", -1),
-        "event_window_event_count": take("window_event_count", "i4"),
-        "event_candidate_count": take("candidate_count", "i4"),
-        "event_blob_area_px": take("blob_area_px", "i4"),
-        "event_confidence": take("confidence", "f4"),
-        "event_rejection_reason": take("rejection_reason", STRING_DTYPE, b""),
-    }
-    if np.any(has):
-        source_seconds = available[safe[has]].astype(np.float64) / 1e9
-        output["event_source_timestamps"][has] = source_seconds
-        output["event_source_age_sec"][has] = timestamps[has] - source_seconds
-    return output
+
+def _sample_sidecar(group, episode, max_observation_age_sec):
+    sample_ns = np.rint(episode.timestamps * 1e9).astype(np.int64)
+    return align_tracker_updates_to_policy_grid(
+        _sidecar_updates(group, episode), sample_ns, max_observation_age_sec)
+
+
+def _put_dataset(group, name, values, *, overwrite):
+    """Create a dataset, accept an identical rerun, or require explicit overwrite."""
+    values = np.asarray(values)
+    if name in group:
+        existing = group[name]
+        if name.endswith("rejection_reason"):
+            same = existing.shape == values.shape and np.array_equal(
+                existing.asstr()[:], values.astype(str))
+        else:
+            same = existing.shape == values.shape and np.array_equal(
+                existing[:], values, equal_nan=True)
+        if same:
+            return
+        if not overwrite:
+            raise ValueError(f"conflicting /{group.name.strip('/')}/{name}; "
+                             "use --overwrite-event-fields")
+        del group[name]
+    if name.endswith("rejection_reason"):
+        group.create_dataset(name, data=np.asarray(values, dtype=STRING_DTYPE))
+    else:
+        group.create_dataset(name, data=values)
 
 
 def enrich(episodes_dir, tracker_output, output_dir, *, overwrite=False,
-           rgb_tracks_dir=None, write_empty_rgb_track=False, require_rgb_2d=False):
+           rgb_tracks_dir=None, write_empty_rgb_track=False, require_rgb_2d=False,
+           overwrite_event_fields=False, max_observation_age_sec=np.inf):
     """Copy and causally enrich episodes, atomically, one file at a time."""
     episodes = discover_episodes(episodes_dir)
     output_dir = Path(output_dir)
@@ -301,21 +509,21 @@ def enrich(episodes_dir, tracker_output, output_dir, *, overwrite=False,
                 shutil.copy2(episode.path, temporary)
                 with h5py.File(temporary, "r+") as target:
                     observations = target["observations"]
-                    if "sparse_tracking" in observations:
-                        del observations["sparse_tracking"]
-                    sparse = observations.create_group("sparse_tracking")
+                    sparse = observations.require_group("sparse_tracking")
                     sampled = _sample_sidecar(
-                        sidecar[f"episodes/{episode.name}"], episode.timestamps)
+                        sidecar[f"episodes/{episode.name}"], episode,
+                        max_observation_age_sec)
                     for name, values in sampled.items():
-                        sparse.create_dataset(name, data=values)
+                        _put_dataset(sparse, name, values,
+                                     overwrite=overwrite_event_fields)
                     sparse.attrs.update({
                         "schema_version": SCHEMA_VERSION,
                         "event_coordinate_system": "openmv_native_unrotated_px",
                         "event_width_px": int(metadata["sensor_width"]),
                         "event_height_px": int(metadata["sensor_height"]),
                         "sampling_policy": (
-                            "latest_tracker_update_at_or_before_"
-                            "observation_timestamp"),
+                            "latest_valid_tracker_update_at_or_before_observation_timestamp"),
+                        "max_observation_age_sec": float(max_observation_age_sec),
                         "invalid_coordinate_fill": 0.0,
                     })
                     if rgb is not None:
@@ -327,17 +535,32 @@ def enrich(episodes_dir, tracker_output, output_dir, *, overwrite=False,
                         valid = np.zeros(len(indices), dtype="u1")
                         points[present] = rgb_points[indices[present]]
                         valid[present] = rgb_valid[indices[present]]
-                        sparse.create_dataset("rgb_2d_px", data=points)
-                        sparse.create_dataset("rgb_valid", data=valid)
+                        rgb_values = (("rgb_2d_px", points),
+                                      ("rgb_valid", valid))
+                        for name, values in rgb_values:
+                            if (name in sparse and
+                                    not np.array_equal(sparse[name][:], values)):
+                                raise ValueError(
+                                    "supplied RGB data conflicts with existing "
+                                    f"{name}")
+                            if name not in sparse:
+                                sparse.create_dataset(name, data=values)
                     elif write_empty_rgb_track:
-                        sparse.create_dataset("rgb_2d_px", data=np.zeros(
-                            (len(episode.timestamps), 2), dtype="f4"))
-                        sparse.create_dataset("rgb_valid", data=np.zeros(
-                            len(episode.timestamps), dtype="u1"))
+                        if "rgb_2d_px" not in sparse:
+                            sparse.create_dataset("rgb_2d_px", data=np.zeros(
+                                (len(episode.timestamps), 2), dtype="f4"))
+                        if "rgb_valid" not in sparse:
+                            sparse.create_dataset("rgb_valid", data=np.zeros(
+                                len(episode.timestamps), dtype="u1"))
                     target.attrs["sparse_tracking_source_raw_events_h5"] = (
                         metadata["raw_events_h5"])
                     target.attrs["sparse_tracking_tracker_config_json"] = (
                         metadata["tracker_config_json"])
+                    for key in ("tracker_config_hash", "tracker_code_version",
+                                "availability_timestamp_domain", "sensor_timestamp_domain",
+                                "pre_roll_ms", "schema_version"):
+                        if key in metadata:
+                            target.attrs[f"sparse_tracking_{key}"] = metadata[key]
                     target.attrs["sparse_tracking_sidecar_h5"] = str(
                         Path(tracker_output).resolve())
                     target.flush()
@@ -370,15 +593,22 @@ def make_parser():
     enrich_parser.add_argument("--tracker-output", required=True)
     enrich_parser.add_argument("--output", required=True)
     enrich_parser.add_argument("--overwrite", action="store_true")
+    enrich_parser.add_argument("--overwrite-event-fields", action="store_true")
+    enrich_parser.add_argument("--max-observation-age-sec", type=float,
+                               default=np.inf)
     _add_rgb_options(enrich_parser)
     build = commands.add_parser("build")
     build.add_argument("--raw-events", required=True)
     build.add_argument("--episodes", required=True)
     build.add_argument("--output", required=True)
     build.add_argument("--tracker-config", required=True)
-    build.add_argument("--tracker-output", required=True)
+    build.add_argument("--tracker-output", "--save-tracker-output",
+                       dest="tracker_output")
+    build.add_argument("--reuse-tracker-output", action="store_true")
     build.add_argument("--pre-roll-ms", type=float, default=0.0)
+    build.add_argument("--max-observation-age-sec", type=float, default=np.inf)
     build.add_argument("--overwrite", action="store_true")
+    build.add_argument("--overwrite-event-fields", action="store_true")
     _add_rgb_options(build)
     return parser
 
@@ -386,17 +616,39 @@ def make_parser():
 def main(argv=None):
     """Run the selected offline dataset command."""
     args = make_parser().parse_args(argv)
+    temporary_sidecar = None
     if args.command in ("run-tracker", "build"):
         if args.pre_roll_ms < 0:
             raise ValueError("--pre-roll-ms must be non-negative")
-        sidecar = args.output if args.command == "run-tracker" else args.tracker_output
-        run_tracker(args.raw_events, args.episodes, sidecar,
-                    args.tracker_config, pre_roll_ms=args.pre_roll_ms)
-    if args.command in ("enrich", "build"):
-        enrich(args.episodes, args.tracker_output, args.output,
-               overwrite=args.overwrite, rgb_tracks_dir=args.rgb_tracks_dir,
-               write_empty_rgb_track=args.write_empty_rgb_track,
-               require_rgb_2d=args.require_rgb_2d)
+        if (args.command == "build" and args.reuse_tracker_output and
+                (not args.tracker_output or
+                 not Path(args.tracker_output).is_file())):
+            raise ValueError(
+                "--reuse-tracker-output requires an existing --tracker-output")
+        if args.command == "run-tracker":
+            sidecar = args.output
+        elif args.tracker_output:
+            sidecar = args.tracker_output
+        else:
+            fd, temporary_sidecar = tempfile.mkstemp(
+                prefix="openmv-tracker-", suffix=".h5")
+            os.close(fd)
+            sidecar = temporary_sidecar
+        if not (args.command == "build" and args.reuse_tracker_output):
+            run_tracker(args.raw_events, args.episodes, sidecar,
+                        args.tracker_config, pre_roll_ms=args.pre_roll_ms)
+    try:
+        if args.command in ("enrich", "build"):
+            tracker_output = args.tracker_output if args.command == "enrich" else sidecar
+            enrich(args.episodes, tracker_output, args.output,
+                   overwrite=args.overwrite, rgb_tracks_dir=args.rgb_tracks_dir,
+                   write_empty_rgb_track=args.write_empty_rgb_track,
+                   require_rgb_2d=args.require_rgb_2d,
+                   overwrite_event_fields=args.overwrite_event_fields,
+                   max_observation_age_sec=args.max_observation_age_sec)
+    finally:
+        if temporary_sidecar is not None:
+            Path(temporary_sidecar).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

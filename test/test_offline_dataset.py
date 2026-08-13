@@ -7,7 +7,8 @@ import pytest
 
 from openmv_cam.event_ball_tracker import TrackerDetection
 from openmv_cam.offline_dataset import (
-    discover_episodes, enrich, load_tracker_config, run_tracker,
+    TrackerUpdate, align_tracker_updates_to_policy_grid, discover_episodes,
+    enrich, load_tracker_config, run_tracker,
 )
 from openmv_cam.offline_raw_events import RawEventHDF5Reader
 
@@ -49,6 +50,42 @@ def episode_file(path, index, start, end, timestamps):
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tracker_update(t_ns, *, valid, x=0, y=0, reason="", episode="episode_0"):
+    return TrackerUpdate(
+        episode, 0, 10, t_ns, t_ns // 1_000_000, 100, 200, x, y,
+        1, 2, 3, .5, valid, valid, 4, 1 if valid else 0,
+        5 if valid else 0, 6 if valid else 0, 2, 3, .7, reason)
+
+
+def test_alignment_holds_valid_detection_across_invalid_and_expires():
+    updates = [tracker_update(1_000_000_000, valid=True, x=4, y=5),
+               tracker_update(1_030_000_000, valid=False, reason="no_blob"),
+               tracker_update(1_060_000_000, valid=True, x=8, y=9)]
+    policy = np.asarray([1_029_999_999, 1_030_000_000, 1_051_000_001,
+                         1_060_000_000], dtype="i8")
+    result = align_tracker_updates_to_policy_grid(updates, policy, .05)
+    assert result["event_2d_px"][:2].tolist() == [[4, 5], [4, 5]]
+    assert result["event_valid"].tolist() == [1, 1, 0, 1]
+    assert result["event_source_timestamps_ns"].tolist() == [
+        1_000_000_000, 1_000_000_000, 1_000_000_000, 1_060_000_000]
+    assert result["event_latest_update_valid"].tolist() == [1, 0, 0, 1]
+    assert result["event_latest_rejection_reason"].tolist() == [
+        "", "no_blob", "no_blob", ""]
+
+
+def test_alignment_rejects_future_sorts_and_resolves_duplicate_timestamps():
+    updates = [tracker_update(2_000_000_000, valid=True, x=20),
+               tracker_update(1_000_000_000, valid=True, x=10),
+               tracker_update(1_000_000_000, valid=False, reason="duplicate")]
+    policy = np.asarray([999_999_999, 1_000_000_000], dtype="i8")
+    result = align_tracker_updates_to_policy_grid(updates, policy, 10)
+    assert result["event_has_update"].tolist() == [0, 1]
+    assert result["event_2d_px"][:, 0].tolist() == [0, 10]
+    assert result["event_latest_update_valid"].tolist() == [0, 0]
+    assert result["event_latest_rejection_reason"].tolist() == ["", "duplicate"]
+    assert result["event_latest_update_timestamp_ns"].tolist() == [-1, 1_000_000_000]
 
 
 @pytest.mark.parametrize("bad, text", [
@@ -114,6 +151,12 @@ def test_tracker_config_and_end_to_end_reset_assignment(tmp_path, monkeypatch):
     assert instances[1].ids == [0, 1]
     assert instances[2].ids == [2]
     with h5py.File(sidecar, "r") as result:
+        metadata = result["metadata"].attrs
+        assert metadata["schema_version"] == "event_tracker_updates_v2"
+        assert metadata["tracker_config_hash"] == hashlib.sha256(
+            metadata["tracker_config_json"].encode()).hexdigest()
+        assert metadata["availability_timestamp_domain"] == "packet_ros_t_ns"
+        assert metadata["sensor_timestamp_domain"] == "genx320_microseconds"
         assert result[
             "episodes/episode_0/available_ros_t_ns"][:].tolist() == [
                 900_000_000, 1_000_000_000]
@@ -163,14 +206,14 @@ def test_enrichment_is_causal_atomic_and_preserves_source(tmp_path):
         sparse = result["observations/sparse_tracking"]
         assert sparse["event_2d_px"].shape == (4, 2)
         assert sparse["event_2d_px"].dtype == np.dtype("f4")
-        assert sparse["event_2d_px"][:].tolist() == [[0, 0], [4, 5], [4, 5], [9, 10]]
+        assert sparse["event_2d_px"][:].tolist() == [[0, 0], [0, 0], [0, 0], [9, 10]]
         assert sparse["event_has_update"][:].tolist() == [0, 1, 1, 1]
         assert sparse["event_valid"][:].tolist() == [0, 0, 0, 1]
-        assert sparse["event_rejection_reason"].asstr()[:].tolist()[1] == "no_blob"
-        assert np.isnan(sparse["event_source_timestamps"][0])
+        assert sparse["event_latest_rejection_reason"].asstr()[:].tolist()[1] == "no_blob"
+        assert sparse["event_source_timestamps_ns"][0] == -1
         assert result.attrs["preserved"] == "yes"
         assert result["observations/images"].dtype == np.dtype("u1")
-        assert sparse.attrs["schema_version"] == "sparse_tracking_v1"
+        assert sparse.attrs["schema_version"] == "sparse_tracking_v2"
         assert result.attrs["sparse_tracking_source_raw_events_h5"] == "/raw.h5"
     with pytest.raises(FileExistsError):
         enrich(episodes, sidecar, output)
@@ -196,3 +239,51 @@ def test_rgb_causal_alignment_and_missing_requirement(tmp_path):
         assert sparse["rgb_valid"][:].tolist() == [0, 1, 1]
     with pytest.raises(ValueError, match="RGB 2D track unavailable"):
         enrich(episodes, sidecar, tmp_path / "required", require_rgb_2d=True)
+
+
+def test_existing_rgb_is_preserved_and_repeated_enrichment_is_idempotent(tmp_path):
+    episodes = tmp_path / "episodes"
+    output = tmp_path / "output"
+    episodes.mkdir()
+    source = episodes / "episode_0.hdf5"
+    episode_file(source, 0, 0, 3, [1.0, 2.0])
+    with h5py.File(source, "r+") as target:
+        sparse = target["observations"].create_group("sparse_tracking")
+        sparse.create_dataset("rgb_2d_px", data=np.asarray([[1, 2], [3, 4]], "f4"))
+        sparse.create_dataset("rgb_valid", data=np.asarray([1, 0], "u1"))
+        sparse.attrs["rgb_metadata"] = "keep"
+    source_before = digest(source)
+    sidecar = tmp_path / "tracker.h5"
+    sidecar_file(sidecar)
+    with pytest.warns(UserWarning):
+        enrich(episodes, sidecar, output)
+    first = digest(output / source.name)
+    with pytest.warns(UserWarning):
+        enrich(episodes, sidecar, output, overwrite=True)
+    assert digest(output / source.name) == first
+    assert digest(source) == source_before
+    with h5py.File(output / source.name, "r") as result:
+        sparse = result["observations/sparse_tracking"]
+        assert sparse["rgb_2d_px"][:].tobytes() == np.asarray(
+            [[1, 2], [3, 4]], "f4").tobytes()
+        assert sparse["rgb_valid"][:].tolist() == [1, 0]
+        assert sparse.attrs["rgb_metadata"] == "keep"
+
+
+def test_event_conflict_is_atomic_and_cleans_temporary_file(tmp_path):
+    episodes = tmp_path / "episodes"
+    output = tmp_path / "output"
+    episodes.mkdir()
+    source = episodes / "episode_0.hdf5"
+    episode_file(source, 0, 0, 3, [1.0, 2.0])
+    with h5py.File(source, "r+") as target:
+        sparse = target["observations"].create_group("sparse_tracking")
+        sparse.create_dataset("event_valid", data=np.asarray([9, 9], "u1"))
+    before = digest(source)
+    sidecar = tmp_path / "tracker.h5"
+    sidecar_file(sidecar)
+    with pytest.raises(ValueError, match="conflicting"):
+        enrich(episodes, sidecar, output)
+    assert digest(source) == before
+    assert not list(output.glob("*.tmp"))
+    assert not (output / source.name).exists()

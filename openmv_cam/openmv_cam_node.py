@@ -124,6 +124,7 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("baud", 115200)
         self.declare_parameter("timeout", 3.0)
         self.declare_parameter("topic", "/openmv_cam/image")
+        self.declare_parameter("publish_mono_img", False)
         self.declare_parameter("publish_3_channel_img", True)
         self.declare_parameter("topic_3_channel", "/openmv_cam/event_frame_3ch")
         self.declare_parameter("event_frame_ch0_ms", 50.0)
@@ -254,6 +255,7 @@ class OpenMVEventCamNode(Node):
         self.baud = self.get_parameter("baud").get_parameter_value().integer_value
         self.timeout = self.get_parameter("timeout").get_parameter_value().double_value
         self.topic = self.get_parameter("topic").get_parameter_value().string_value.strip()
+        publish_mono_img = bool(self.get_parameter("publish_mono_img").value)
         self.publish_3_channel_img = self.get_parameter("publish_3_channel_img").get_parameter_value().bool_value
         self.topic_3_channel = self.get_parameter("topic_3_channel").get_parameter_value().string_value.strip()
         self.event_frame_windows_ms = [
@@ -559,7 +561,7 @@ class OpenMVEventCamNode(Node):
             publish_xyt_voxel=self.publish_xyt_voxel,
             publish_event_voxel_1ms=self.publish_event_voxel_1ms,
         )
-        self.publish_mono_img = outputs.mono
+        self.publish_mono_img = outputs.mono and publish_mono_img
         self.publish_3_channel_img = outputs.event_frame_3ch
         self.publish_xyt_voxel = outputs.legacy_voxel
         self.publish_event_voxel_1ms = outputs.event_voxel_1ms

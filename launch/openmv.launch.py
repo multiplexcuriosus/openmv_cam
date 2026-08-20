@@ -56,6 +56,11 @@ def generate_launch_description():
         "event_packet_margin_ms",
         default_value="50.0",
     )
+    publish_mono_img_arg = DeclareLaunchArgument(
+        "publish_mono_img",
+        default_value="false",
+        description="Publish the mono event image on /openmv_cam/image",
+    )
     publish_xyt_voxel_arg = DeclareLaunchArgument(
         "publish_xyt_voxel",
         default_value="false",
@@ -183,6 +188,7 @@ def generate_launch_description():
         "event_scaling": LaunchConfiguration("event_scaling"),
         "event_clip_count": LaunchConfiguration("event_clip_count"),
         "event_packet_margin_ms": LaunchConfiguration("event_packet_margin_ms"),
+        "publish_mono_img": LaunchConfiguration("publish_mono_img"),
         "publish_xyt_voxel": LaunchConfiguration("publish_xyt_voxel"),
         "topic_xyt_voxel": LaunchConfiguration("topic_xyt_voxel"),
         "event_voxel_horizon_ms": LaunchConfiguration("event_voxel_horizon_ms"),
@@ -262,6 +268,7 @@ def generate_launch_description():
         event_scaling_arg,
         event_clip_count_arg,
         event_packet_margin_ms_arg,
+        publish_mono_img_arg,
         publish_xyt_voxel_arg,
         topic_xyt_voxel_arg,
         event_voxel_horizon_ms_arg,

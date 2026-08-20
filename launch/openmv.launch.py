@@ -19,6 +19,10 @@ def generate_launch_description():
         "event_frame_mode",
         default_value="shifted",
     )
+    event_wire_mode_arg = DeclareLaunchArgument(
+        "event_wire_mode",
+        default_value="processed_evt1",
+    )
     replay_defaults = {
         "event_input_mode": "hardware",
         "event_replay_path": "",
@@ -181,6 +185,7 @@ def generate_launch_description():
 
     openmv_params = dict(OPENMV_PARAMS)
     openmv_params.update({
+        "event_wire_mode": LaunchConfiguration("event_wire_mode"),
         "event_frame_mode": LaunchConfiguration("event_frame_mode"),
         "event_frame_ch0_ms": LaunchConfiguration("event_frame_ch0_ms"),
         "event_frame_ch1_ms": LaunchConfiguration("event_frame_ch1_ms"),
@@ -261,6 +266,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         *replay_args,
+        event_wire_mode_arg,
         event_frame_mode_arg,
         event_frame_ch0_ms_arg,
         event_frame_ch1_ms_arg,

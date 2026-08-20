@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import json
-import struct
 import threading
 import time
 from collections import deque
@@ -41,8 +40,21 @@ from .event_ball_tracker import (
     render_debug_images,
     trace_detail_json,
 )
-from .evt1_protocol import EventPacket, MAX_EVENT_COUNT, reconstruct_timestamps_us
+from .evt1_protocol import (
+    EVT1_HEADER_LENGTH,
+    EVT1_MAGIC,
+    EventPacket,
+    parse_evt1_header,
+    reconstruct_timestamps_us,
+)
 from .hdf5_replay import HDF5ReplayReader, ReplayDiagnostics, replay_packets
+from .raw_evt2_protocol import (
+    EVR1_HEADER_LENGTH,
+    EVR1_MAGIC,
+    decode_evt20,
+    parse_evr1_header,
+    sequence_gap,
+)
 
 
 def build_hwc9_image_message(
@@ -106,9 +118,7 @@ def build_activity_image_message(
 
 
 class OpenMVEventCamNode(Node):
-    MAGIC = b"EVT1"
-    HEADER_FMT = "<LL"   # event_count, payload_len
-    HEADER_SIZE = 4 + struct.calcsize(HEADER_FMT)
+    HEADER_SIZE = 4 + EVT1_HEADER_LENGTH
 
     print_log = False
 
@@ -123,6 +133,7 @@ class OpenMVEventCamNode(Node):
         self.declare_parameter("port", "/dev/openmvcam")
         self.declare_parameter("baud", 115200)
         self.declare_parameter("timeout", 3.0)
+        self.declare_parameter("event_wire_mode", "processed_evt1")
         self.declare_parameter("topic", "/openmv_cam/image")
         self.declare_parameter("publish_mono_img", False)
         self.declare_parameter("publish_3_channel_img", True)
@@ -254,6 +265,11 @@ class OpenMVEventCamNode(Node):
         self.port_name = self.get_parameter("port").get_parameter_value().string_value
         self.baud = self.get_parameter("baud").get_parameter_value().integer_value
         self.timeout = self.get_parameter("timeout").get_parameter_value().double_value
+        self.event_wire_mode = str(
+            self.get_parameter("event_wire_mode").value).strip().lower()
+        if self.event_wire_mode not in ("processed_evt1", "raw_evt20"):
+            raise ValueError(
+                "event_wire_mode must be 'processed_evt1' or 'raw_evt20'")
         self.topic = self.get_parameter("topic").get_parameter_value().string_value.strip()
         publish_mono_img = bool(self.get_parameter("publish_mono_img").value)
         self.publish_3_channel_img = self.get_parameter("publish_3_channel_img").get_parameter_value().bool_value
@@ -639,6 +655,9 @@ class OpenMVEventCamNode(Node):
         self.total_events = 0
         self.total_payload_bytes = 0
         self.total_protocol_bytes = 0
+        self._evt20_time_high = 0
+        self._last_raw_sequence = None
+        self.raw_sequence_gap_count = 0
         self.t0 = time.monotonic()
         self.last_stats_print = self.t0
 
@@ -1180,16 +1199,16 @@ class OpenMVEventCamNode(Node):
             data.extend(chunk)
         return bytes(data)
 
-    def _read_until_magic(self):
+    def _read_until_magic(self, magic):
         window = bytearray()
         while not self._stop_event.is_set():
             b = self.serial_port.read(1)
             if not b:
                 raise RuntimeError("Timeout while waiting for magic.")
             window += b
-            if len(window) > len(self.MAGIC):
-                window = window[-len(self.MAGIC):]
-            if bytes(window) == self.MAGIC:
+            if len(window) > len(magic):
+                window = window[-len(magic):]
+            if bytes(window) == magic:
                 return
         raise RuntimeError("Stop requested.")
 
@@ -1545,30 +1564,10 @@ class OpenMVEventCamNode(Node):
     def _reader_loop(self):
         while not self._stop_event.is_set():
             try:
-                self._read_until_magic()
-                header_rest = self._read_exactly(struct.calcsize(self.HEADER_FMT))
-                event_count, payload_len = struct.unpack(self.HEADER_FMT, header_rest)
-
-                if event_count > MAX_EVENT_COUNT:
-                    raise RuntimeError(
-                        f"Invalid event count: {event_count} exceeds {MAX_EVENT_COUNT}")
-
-                expected_len = event_count * 6 * 2
-                if payload_len != expected_len:
-                    raise RuntimeError(
-                        f"Invalid payload length: got {payload_len}, expected {expected_len}"
-                    )
-
-                payload = self._read_exactly(payload_len)
-                # Host receipt is sampled only once the complete EVT1 packet is available.
-                packet_ros_t_ns = int(self.get_clock().now().nanoseconds)
-                packet_mono_t_ns = int(time.monotonic_ns())
-
-                packet_id = int(self.total_packets + 1)
-                packet = EventPacket.decode(
-                    payload, event_count=event_count, payload_length=payload_len,
-                    packet_id=packet_id, packet_ros_stamp_ns=packet_ros_t_ns,
-                    packet_monotonic_stamp_ns=packet_mono_t_ns)
+                if self.event_wire_mode == "processed_evt1":
+                    packet = self._read_processed_evt1_packet()
+                else:
+                    packet = self._read_raw_evt20_packet()
                 self._process_packet(packet)
 
             except RuntimeError as e:
@@ -1581,6 +1580,46 @@ class OpenMVEventCamNode(Node):
                 self.get_logger().warn(f"Unexpected error in reader loop: {e}")
                 self._stop_event.wait(0.05)
 
+    def _read_processed_evt1_packet(self):
+        self._read_until_magic(EVT1_MAGIC)
+        header = self._read_exactly(EVT1_HEADER_LENGTH)
+        event_count, payload_len = parse_evt1_header(header)
+        payload = self._read_exactly(payload_len)
+        # Host receipt is sampled only once the complete packet is available.
+        packet_ros_t_ns = int(self.get_clock().now().nanoseconds)
+        packet_mono_t_ns = int(time.monotonic_ns())
+        return EventPacket.decode(
+            payload, event_count=event_count, payload_length=payload_len,
+            packet_id=int(self.total_packets + 1),
+            packet_ros_stamp_ns=packet_ros_t_ns,
+            packet_monotonic_stamp_ns=packet_mono_t_ns)
+
+    def _read_raw_evt20_packet(self):
+        self._read_until_magic(EVR1_MAGIC)
+        header = self._read_exactly(EVR1_HEADER_LENGTH)
+        sequence, payload_len = parse_evr1_header(header)
+        payload = self._read_exactly(payload_len)
+        packet_ros_t_ns = int(self.get_clock().now().nanoseconds)
+        packet_mono_t_ns = int(time.monotonic_ns())
+        events, self._evt20_time_high = decode_evt20(
+            payload, self._evt20_time_high)
+
+        gap = sequence_gap(self._last_raw_sequence, sequence)
+        if gap:
+            self.raw_sequence_gap_count += gap
+            self.get_logger().warn(
+                "Raw EVR1 sequence gap: "
+                f"previous={self._last_raw_sequence}, current={sequence}, "
+                f"missing={gap}")
+        self._last_raw_sequence = sequence
+        return EventPacket.from_decoded_events(
+            np.asarray(events, dtype=np.uint16).reshape((-1, 6)),
+            packet_id=int(self.total_packets + 1),
+            packet_ros_stamp_ns=packet_ros_t_ns,
+            packet_monotonic_stamp_ns=packet_mono_t_ns,
+            wire_format="raw_evt20", wire_payload_length=payload_len,
+            wire_sequence=sequence)
+
     def _process_packet(self, packet: EventPacket):
         """Drive every downstream consumer for hardware and replay packets."""
         if self._stop_event.is_set():
@@ -1588,8 +1627,12 @@ class OpenMVEventCamNode(Node):
         now = time.monotonic()
         self.total_packets += 1
         self.total_events += packet.event_count
-        self.total_payload_bytes += packet.payload_length
-        self.total_protocol_bytes += packet.payload_length + self.HEADER_SIZE
+        wire_payload_length = (
+            packet.wire_payload_length
+            if packet.wire_payload_length > 0 or packet.event_count == 0
+            else packet.payload_length)
+        self.total_payload_bytes += wire_payload_length
+        self.total_protocol_bytes += wire_payload_length + self.HEADER_SIZE
         if self.total_packets <= 3 and packet.event_count > 0:
             events = packet.events
             self.get_logger().info(

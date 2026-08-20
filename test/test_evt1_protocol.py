@@ -1,7 +1,11 @@
+import struct
+
 import numpy as np
 import pytest
 
-from openmv_cam.evt1_protocol import EventPacket, reconstruct_timestamps_us
+from openmv_cam.evt1_protocol import (
+    EventPacket, parse_evt1_header, reconstruct_timestamps_us,
+)
 
 
 def test_evt1_timestamp_reconstruction_and_little_endian_decode():
@@ -13,6 +17,14 @@ def test_evt1_timestamp_reconstruction_and_little_endian_decode():
     assert packet.events.dtype == np.dtype("uint16")
     assert packet.timestamps_us.tolist() == [2_003_004, 1_999_999]
     assert packet.first_event_timestamp_us == 1_999_999
+    assert packet.wire_format == "processed_evt1"
+    assert packet.wire_payload_length == 24
+
+
+def test_evt1_header_behavior_is_unchanged():
+    assert parse_evt1_header(struct.pack("<LL", 2, 24)) == (2, 24)
+    with pytest.raises(ValueError):
+        parse_evt1_header(struct.pack("<LL", 2, 12))
 
 
 def test_evt1_rejects_inconsistent_length():

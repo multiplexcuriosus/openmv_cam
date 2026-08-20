@@ -1,5 +1,41 @@
 # OpenMV event camera ROS node
 
+## Hardware wire modes
+
+The hardware serial reader supports two custom USB VCP wire formats. The
+default remains `processed_evt1` for compatibility:
+
+```bash
+ros2 launch openmv_cam openmv.launch.py event_wire_mode:=processed_evt1
+ros2 launch openmv_cam openmv.launch.py event_wire_mode:=raw_evt20
+```
+
+`processed_evt1` requires the existing H7 script
+`openmv_cam/helpers/main.py`. It sends `EVT1`, an `<LL>` event-count/payload
+header, and decoded six-`uint16` rows.
+
+`raw_evt20` requires `openmv_cam/helpers/main_raw_evt20.py` and OpenMV firmware
+that provides `csi.IOCTL_GENX320_READ_EVENTS_RAW`. The script sends the chip's
+native EVT2.0 bytes over `USB_VCP` using this custom framing:
+
+```text
+magic   b"EVR1"
+header  struct.pack("<LL", sequence, payload_length)
+payload native little-endian EVT2.0 words (payload_length % 4 == 0)
+```
+
+The sequence is a wrapping unsigned 32-bit packet counter. The ROS node warns
+about gaps and decodes CD words while preserving TIME_HIGH state across EVR1
+packets. TIME_HIGH, TRIGGER, and other control words are not recorded as CD
+events.
+
+This EVR1/USB_VCP stream is intentionally separate from the official OpenMV
+Protocol V2 benchmark/streaming script. The ROS node uses `pyserial` and a
+custom framing protocol; Protocol V2 cannot be selected here unless a complete
+Protocol V2 bridge is implemented. The H7 script and `event_wire_mode` must
+always match: `openmv_cam/helpers/main.py` for `processed_evt1`, and
+`openmv_cam/helpers/main_raw_evt20.py` for `raw_evt20`.
+
 ## Offline sparse-tracking datasets (no ROS required)
 
 `openmv_cam.offline_dataset` streams packet slices from a raw-event HDF5,

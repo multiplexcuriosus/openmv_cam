@@ -8,7 +8,7 @@ from pyb import USB_VCP
 
 MAGIC = b"EVR1"
 HEADER_FORMAT = "<LL"
-EVENT_BUFFER_SIZE = 8192
+EVENT_BUFFER_SIZE = 2048
 CSI_FIFO_DEPTH = 8
 
 
@@ -33,6 +33,7 @@ csi0.ioctl(
     csi.GENX320_MODE_EVENT,
     EVENT_BUFFER_SIZE,
 )
+csi0.__write_reg(0x7044, 0)
 csi0.framebuffers(CSI_FIFO_DEPTH)
 csi0.ioctl(csi.IOCTL_GENX320_SET_AFK, 1, 238, 242)
 csi0.ioctl(csi.IOCTL_GENX320_SET_BIASES, csi.GENX320_BIASES_LOW_NOISE)

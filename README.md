@@ -24,6 +24,10 @@ header  struct.pack("<LL", sequence, payload_length)
 payload native little-endian EVT2.0 words (payload_length % 4 == 0)
 ```
 
+The ROS receiver accepts at most 8192 native 32-bit words (32768 payload
+bytes) in one EVR1 packet. The supplied H7 script uses a 2048-word raw event
+buffer by default.
+
 The sequence is a wrapping unsigned 32-bit packet counter. The ROS node warns
 about gaps and decodes CD words while preserving TIME_HIGH state across EVR1
 packets. TIME_HIGH, TRIGGER, and other control words are not recorded as CD

@@ -6,7 +6,7 @@ import struct
 EVR1_MAGIC = b"EVR1"
 EVR1_HEADER_FORMAT = "<LL"
 EVR1_HEADER_LENGTH = struct.calcsize(EVR1_HEADER_FORMAT)
-# Match the existing 8192-event hardware buffer while allowing control words.
+# Accept at most 8192 native 32-bit EVT2.0 words per EVR1 payload.
 MAX_RAW_PAYLOAD_SIZE = 8192 * 4
 
 CD_TYPES = (0x0, 0x1)
@@ -28,10 +28,19 @@ def parse_evr1_header(header: bytes) -> tuple[int, int]:
 
 
 def sequence_gap(previous: int | None, current: int) -> int:
-    """Return the number of missing uint32 sequence values, including wrap."""
+    """Return a safe missing-packet count for a uint32 sequence stream."""
     if previous is None:
         return 0
-    return ((int(current) - int(previous)) & 0xFFFFFFFF) - 1
+
+    delta = (int(current) - int(previous)) & 0xFFFFFFFF
+
+    if delta == 0:
+        return 0
+
+    if delta > 0x80000000:
+        return 0
+
+    return delta - 1
 
 
 def decode_evt20(payload, time_high: int = 0):

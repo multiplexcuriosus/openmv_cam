@@ -66,10 +66,24 @@ def test_evr1_header_validation():
         parse_evr1_header(struct.pack("<LL", 17, MAX_RAW_PAYLOAD_SIZE + 4))
 
 
-def test_sequence_gap_detection_including_wrap():
+def test_sequence_gap_first_packet():
     assert sequence_gap(None, 4) == 0
+
+
+def test_sequence_gap_duplicate():
+    assert sequence_gap(4, 4) == 0
+
+
+def test_sequence_gap_h7_restart_or_backward_reset():
+    assert sequence_gap(1234, 0) == 0
+
+
+def test_sequence_gap_normal_forward_gap():
     assert sequence_gap(4, 5) == 0
     assert sequence_gap(4, 7) == 2
+
+
+def test_sequence_gap_uint32_wrap():
     assert sequence_gap(0xFFFFFFFF, 0) == 0
 
 

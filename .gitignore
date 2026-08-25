@@ -5,3 +5,4 @@ openmv_cam/tuning_out/*
 *.pyc
 *.pdf
 *.npz
+trajectory-analysis-sidecar/

@@ -25,6 +25,14 @@ def packet(rows, packet_id=1, ros_ns=9_000_000_000):
         packet_monotonic_stamp_ns=123456)
 
 
+def raw_packet(rows, packet_id=1, source_packet_id=1):
+    return EventPacket.from_decoded_events(
+        np.asarray(rows, dtype=np.uint16).reshape(-1, 6),
+        packet_id=packet_id, packet_ros_stamp_ns=9_000_000_000,
+        packet_monotonic_stamp_ns=123456, wire_format="raw_evt20",
+        wire_sequence=source_packet_id)
+
+
 def event(t_us, x, y, polarity=1):
     sec, rem = divmod(t_us, 1_000_000)
     ms, us = divmod(rem, 1000)
@@ -117,6 +125,53 @@ def test_one_packet_produces_at_most_one_detection():
     assert len(result) == 1
     assert subject.counters["processed_1ms_bins"] >= 16
     assert subject.counters["window_updates"] == 1
+
+
+def test_update_ids_include_invalid_windows_and_increase_monotonically():
+    subject = tracker(x_crop=(0, 300), min_blob_area_px=10)
+    first = complete_window(subject, [event(100, 10, 20)], 1)[0]
+    second = complete_window(subject, [event(11_100, 20, 20)], 2)[0]
+    assert not first.valid and not second.valid
+    assert [first.tracker_update_id, second.tracker_update_id] == [1, 2]
+    assert subject.statistics()["invalid_detections"] == 2
+
+
+def test_raw_source_packet_provenance_uses_newest_contributor():
+    subject = tracker(x_crop=(0, 300))
+    subject.update(raw_packet(
+        [event(100, 10, 20), event(1100, 11, 20)], 1, 40))
+    result = subject.update(raw_packet(
+        [event(2100, 12, 20), event(3100, 319, 319)], 2, 41))[0]
+    assert result.source_packet_id_valid
+    assert result.source_packet_id == 41
+    assert result.parent_packet_id == 2
+    assert (result.window_start_us, result.window_end_us) == (-7000, 3000)
+
+
+def test_source_packet_id_falls_back_to_invalid_for_processed_evt1():
+    result = complete_window(
+        tracker(x_crop=(0, 300)), [event(100, 10, 20)], 7)[0]
+    assert not result.source_packet_id_valid
+    assert result.source_packet_id == 0
+
+
+def test_completion_trace_contains_full_update_provenance():
+    detection = TrackerDetection(
+        10, 20, 3, 4, tracker_update_id=9, source_packet_id=77,
+        source_packet_id_valid=True, window_start_us=10, window_end_us=20,
+        x_px=1.0, y_px=2.0, vx_px_s=3.0, vy_px_s=4.0, valid=False,
+        rejection_reason="no_valid_candidates", candidate_count=2,
+        window_event_count=4, confidence=0.25, velocity_valid=False)
+    detail = json.loads(trace_detail_json(detection, 123456789))
+    required = {
+        "tracker_update_id", "source_packet_id", "source_packet_id_valid",
+        "availability_timestamp_ns", "sensor_window_start_us",
+        "sensor_window_end_us", "valid", "rejection_reason",
+        "candidate_count", "window_event_count", "confidence",
+        "velocity_valid"}
+    assert required <= detail.keys()
+    assert detail["rejection_reason"] == "no_valid_candidates"
+    assert detail["availability_timestamp_ns"] == 123456789
 
 
 def test_sparse_elongated_trail_does_not_require_circularity():

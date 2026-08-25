@@ -135,6 +135,7 @@ def generate_launch_description():
         "event_tracker_position_topic": "/openmv_cam/event_tracker/ball_2d_px",
         "event_tracker_velocity_topic": "/openmv_cam/event_tracker/ball_velocity_px_s",
         "event_tracker_valid_topic": "/openmv_cam/event_tracker/valid",
+        "event_tracker_update_topic": "/openmv_cam/event_tracker/update",
         "event_tracker_bin_ms": "1.0",
         "event_tracker_accumulation_window_ms": "3.0",
         "event_tracker_history_limit_ms": "100.0",

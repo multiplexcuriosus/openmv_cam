@@ -248,10 +248,36 @@ Outputs (only for valid detections) are:
   (`geometry_msgs/msg/Vector3Stamped`; z is scalar speed)
 - `/openmv_cam/event_tracker/valid` (`std_msgs/msg/Bool`)
 
+Every completed tracker window, valid or invalid, additionally publishes
+`openmv_cam/msg/EventTrackerUpdate` on
+`/openmv_cam/event_tracker/update` with the same reliable depth-10 QoS used by
+the legacy tracker publishers. Its
+`tracker_update_id` increments once per window. `source_packet_id` is the EVR1
+sequence of the newest raw EVT2.0 packet whose events occur in that window;
+`source_packet_id_valid=false` is used for processed EVT1 input and current HDF5
+recordings, which do not preserve that hardware sequence. `header.stamp` and
+`availability_timestamp_ns` identify the same host ROS-clock result-availability
+instant. The half-open `sensor_window_start_us`/`sensor_window_end_us` interval
+is in the GenX320 microsecond domain and is never placed in a ROS epoch field.
+
+The downstream data path is:
+
+```text
+raw EVR1/EVT2.0 packet -> sliding tracker window -> EventTrackerUpdate
+                                               -> legacy valid-only topics
+                                               -> ACT observation association
+```
+
+ACT should subscribe to the typed update topic for observation provenance and
+may continue using the legacy topics for compatibility. Invalid updates retain
+available counts and diagnostics and carry a stable `rejection_reason`.
+
 Coordinates are native OpenMV/GENX320 pixels: 320x320, top-left origin, x right,
 y down, and `frame_id=openmv_cam`. Tracker coordinates are never rotated.
-Message header stamps are the host ROS publication time. Sensor microseconds
-are used for binning and velocity only; they are not ROS epoch timestamps.
+Legacy PointStamped and Vector3Stamped header stamps are the host ROS result
+availability/publication time, shared with the typed update for that result.
+Sensor microseconds are used for binning and velocity only; they are not ROS
+epoch timestamps.
 
 The tracker defaults to enabled with the tuned ball-tracking configuration.
 Important parameters and defaults are:
@@ -260,6 +286,7 @@ Important parameters and defaults are:
 - `event_tracker_position_topic=/openmv_cam/event_tracker/ball_2d_px`
 - `event_tracker_velocity_topic=/openmv_cam/event_tracker/ball_velocity_px_s`
 - `event_tracker_valid_topic=/openmv_cam/event_tracker/valid`
+- `event_tracker_update_topic=/openmv_cam/event_tracker/update`
 - `event_tracker_bin_ms=1.0`
 - `event_tracker_accumulation_window_ms=3.0`
 - `event_tracker_history_limit_ms=100.0`
@@ -382,8 +409,9 @@ Optional latency traces use best-effort QoS on
 validated packets; at most one `complete` trace is emitted for the packet-level
 sliding-window update and carries packet lineage in `parent_sequence`. Both use stage
 `event_2d_ball_detection` and modality `event`. ROS timestamp fields contain
-host-clock values. GENX320 window timestamps and finite raw-event detection/blob
-values are kept in `detail_json`. Consequently source-to-output latency begins when a
+host-clock values. GENX320 window timestamps, per-update provenance, validity,
+rejection reason, candidate/window counts, confidence, and velocity validity are
+kept in `detail_json`. Consequently source-to-output latency begins when a
 complete EVT1 packet is available on the PC, not at physical sensor exposure.
 If `intercept_latency_monitor` is not installed, tracing logs an error and is
 disabled without stopping the reader. Configure with:

@@ -12,6 +12,7 @@ import numpy as np
 
 from .event_frame_contract import render_event_frame_from_arrays
 from .evt1_protocol import EventPacket
+from .raw_evt2_protocol import sequence_gap
 
 
 @dataclass
@@ -22,6 +23,9 @@ class TrackerDetection:
     bin_end_us: int
     parent_packet_id: int
     event_count: int
+    tracker_update_id: int = 0
+    source_packet_id: int = 0
+    source_packet_id_valid: bool = False
     window_start_us: int = 0
     window_end_us: int = 0
     window_event_count: int = 0
@@ -167,6 +171,9 @@ class EventBallTracker:
         # exact timestamps so non-bin-aligned sliding-window edges stay exact.
         self.pending = defaultdict(list)
         self.pending_timestamps = defaultdict(list)
+        self.pending_packet_ids = defaultdict(list)
+        self.pending_source_packet_ids = defaultdict(list)
+        self.pending_source_packet_valid = defaultdict(list)
         self.max_history_bins = (
             int(math.ceil(self.history_limit_us / self.bin_us)) + 2)
         self.history_bins = deque(maxlen=self.max_history_bins)
@@ -184,6 +191,8 @@ class EventBallTracker:
         self._debug_lock = threading.Lock()
         self._latest_debug_snapshot = None
         self._last_removed_component_contours = ()
+        self._tracker_update_id = 0
+        self._last_source_packet_id = None
 
     def _valid_event_coordinates(self, events):
         x = events[:, 4].astype(np.int64)
@@ -409,9 +418,16 @@ class EventBallTracker:
             start = self.next_bin_start_us
             rows = self.pending.pop(start, [])
             timestamps = self.pending_timestamps.pop(start, [])
+            packet_ids = self.pending_packet_ids.pop(start, [])
+            source_packet_ids = self.pending_source_packet_ids.pop(start, [])
+            source_packet_valid = self.pending_source_packet_valid.pop(start, [])
             events_array = np.asarray(rows, dtype=np.uint16).reshape(-1, 6)
             timestamps_array = np.asarray(timestamps, dtype=np.int64)
-            self.history_bins.append((start, events_array, timestamps_array))
+            self.history_bins.append((
+                start, events_array, timestamps_array,
+                np.asarray(packet_ids, dtype=np.int64),
+                np.asarray(source_packet_ids, dtype=np.uint64),
+                np.asarray(source_packet_valid, dtype=bool)))
             self.next_bin_start_us += self.bin_us
             completed += 1
             self.counters["processed_1ms_bins"] += 1
@@ -421,7 +437,11 @@ class EventBallTracker:
     def _window_events(self, window_start_us, window_end_us):
         event_chunks = []
         timestamp_chunks = []
-        for _, events, timestamps in self.history_bins:
+        packet_id_chunks = []
+        source_id_chunks = []
+        source_valid_chunks = []
+        for (_, events, timestamps, packet_ids, source_ids,
+             source_valid) in self.history_bins:
             if not timestamps.size:
                 continue
             selected = ((timestamps >= window_start_us) &
@@ -429,10 +449,18 @@ class EventBallTracker:
             if np.any(selected):
                 event_chunks.append(events[selected])
                 timestamp_chunks.append(timestamps[selected])
+                packet_id_chunks.append(packet_ids[selected])
+                source_id_chunks.append(source_ids[selected])
+                source_valid_chunks.append(source_valid[selected])
         if not event_chunks:
             return (np.empty((0, 6), dtype=np.uint16),
-                    np.empty((0,), dtype=np.int64))
-        return np.concatenate(event_chunks), np.concatenate(timestamp_chunks)
+                    np.empty((0,), dtype=np.int64),
+                    np.empty((0,), dtype=np.int64),
+                    np.empty((0,), dtype=np.uint64),
+                    np.empty((0,), dtype=bool))
+        return (np.concatenate(event_chunks), np.concatenate(timestamp_chunks),
+                np.concatenate(packet_id_chunks), np.concatenate(source_id_chunks),
+                np.concatenate(source_valid_chunks))
 
     def _trim_history(self, window_start_us):
         retention_start_us = window_start_us
@@ -448,7 +476,8 @@ class EventBallTracker:
             self.history_bins.popleft()
 
     def _process_window(self, window_start_us, window_end_us, events,
-                        parent_id):
+                        parent_id, source_packet_id=0,
+                        source_packet_id_valid=False):
         total_start = time.monotonic_ns()
         t = time.monotonic_ns()
         activity = self.build_activity_map(events)
@@ -463,9 +492,13 @@ class EventBallTracker:
         selected, selection_reason = self._select(
             candidates, predicted_position)
         window_event_count = int(activity.sum())
+        self._tracker_update_id += 1
         detection = TrackerDetection(
             bin_start_us=window_start_us, bin_end_us=window_end_us,
             parent_packet_id=parent_id, event_count=window_event_count,
+            tracker_update_id=self._tracker_update_id,
+            source_packet_id=source_packet_id,
+            source_packet_id_valid=source_packet_id_valid,
             window_start_us=window_start_us, window_end_us=window_end_us,
             window_event_count=window_event_count,
             candidate_count=len(candidates), start_steady_ns=total_start,
@@ -499,6 +532,7 @@ class EventBallTracker:
         else:
             self.missed_updates += 1
             self.counters["invalid_detections"] += 1
+            self.counters[f"rejection_{detection.rejection_reason}"] += 1
         detection.end_steady_ns = time.monotonic_ns()
         elapsed = (detection.end_steady_ns - total_start) / 1e6
         self.timings["computation"].append(elapsed)
@@ -519,7 +553,7 @@ class EventBallTracker:
         debug_events = None
         if self.debug_event_frame_window_us is not None:
             debug_start_us = window_end_us - self.debug_event_frame_window_us
-            debug_events, _ = self._window_events(
+            debug_events, _, _, _, _ = self._window_events(
                 debug_start_us, window_end_us)
             debug_events = debug_events.copy()
             debug_events.setflags(write=False)
@@ -555,6 +589,10 @@ class EventBallTracker:
         self.counters["packets_received"] += 1
         self.counters["packets_with_events"] += int(packet.event_count > 0)
         self.counters["events_received"] += packet.event_count
+        if packet.wire_format == "raw_evt20" and packet.wire_sequence >= 0:
+            gap = sequence_gap(self._last_source_packet_id, packet.wire_sequence)
+            self.counters["source_packet_gaps"] += gap
+            self._last_source_packet_id = packet.wire_sequence
         if packet.event_count == 0:
             elapsed_ms = (time.monotonic_ns() - update_start) / 1e6
             self.timings["total_tracker_update"].append(elapsed_ms)
@@ -570,6 +608,12 @@ class EventBallTracker:
                 continue
             self.pending[bin_start].append(event)
             self.pending_timestamps[bin_start].append(int(timestamp))
+            self.pending_packet_ids[bin_start].append(int(packet.packet_id))
+            source_valid = (
+                packet.wire_format == "raw_evt20" and packet.wire_sequence >= 0)
+            self.pending_source_packet_ids[bin_start].append(
+                int(packet.wire_sequence) if source_valid else 0)
+            self.pending_source_packet_valid[bin_start].append(source_valid)
         packet_max = packet.last_event_timestamp_us
         self.max_seen_timestamp_us = max(
             packet_max, self.max_seen_timestamp_us or packet_max)
@@ -579,11 +623,17 @@ class EventBallTracker:
             window_end_us = self.next_bin_start_us
             window_start_us = window_end_us - self.accumulation_window_us
             self._trim_history(window_start_us)
-            window_events, _ = self._window_events(
+            (window_events, _, packet_ids, source_ids,
+             source_valid) = self._window_events(
                 window_start_us, window_end_us)
+            parent_id = int(packet_ids[-1]) if packet_ids.size else packet.packet_id
+            newest = int(np.argmax(packet_ids)) if packet_ids.size else -1
+            provenance_valid = bool(source_valid[newest]) if newest >= 0 else False
             output.append(self._process_window(
                 window_start_us, window_end_us, window_events,
-                packet.packet_id))
+                parent_id,
+                int(source_ids[newest]) if provenance_valid else 0,
+                provenance_valid))
         elapsed_ms = (time.monotonic_ns() - update_start) / 1e6
         self.timings["total_tracker_update"].append(elapsed_ms)
         return output
@@ -596,8 +646,15 @@ class EventBallTracker:
             result.get("processed_1ms_bins", 0) / elapsed)
         result["window_update_rate_hz"] = (
             result.get("window_updates", 0) / elapsed)
+        result["tracker_update_rate_hz"] = result["window_update_rate_hz"]
         result["valid_detection_rate_hz"] = (
             result.get("valid_detections", 0) / elapsed)
+        result["valid_update_rate_hz"] = result["valid_detection_rate_hz"]
+        result["invalid_update_rate_hz"] = (
+            result.get("invalid_detections", 0) / elapsed)
+        result["rejection_counts"] = {
+            key.removeprefix("rejection_"): value
+            for key, value in result.items() if key.startswith("rejection_")}
         result["position_output_rate_hz"] = result["valid_detection_rate_hz"]
         for name, values in self.timings.items():
             array = np.asarray(values, dtype=float)
@@ -608,10 +665,17 @@ class EventBallTracker:
         return result
 
 
-def trace_detail_json(detection: TrackerDetection) -> str:
+def trace_detail_json(detection: TrackerDetection,
+                      availability_timestamp_ns=None) -> str:
     """Build finite JSON with sensor timestamps outside ROS stamp fields."""
     detail = {
+        "tracker_update_id": detection.tracker_update_id,
+        "source_packet_id": detection.source_packet_id,
+        "source_packet_id_valid": detection.source_packet_id_valid,
         "sensor_timestamp_domain": "genx320_microseconds",
+        "sensor_window_start_us": detection.window_start_us,
+        "sensor_window_end_us": detection.window_end_us,
+        # Compatibility aliases retained for existing trace consumers.
         "window_start_us": detection.window_start_us,
         "window_end_us": detection.window_end_us,
         "window_event_count": detection.window_event_count,
@@ -619,6 +683,7 @@ def trace_detail_json(detection: TrackerDetection) -> str:
         "bin_end_us": detection.bin_end_us,
         "event_count": detection.event_count,
         "candidate_count": detection.candidate_count,
+        "confidence": detection.confidence,
         "selected_raw_event_count": detection.blob_event_count,
         "x_px": detection.x_px, "y_px": detection.y_px,
         "vx_px_s": detection.vx_px_s, "vy_px_s": detection.vy_px_s,
@@ -632,6 +697,8 @@ def trace_detail_json(detection: TrackerDetection) -> str:
         "valid": detection.valid,
         "rejection_reason": detection.rejection_reason,
     }
+    if availability_timestamp_ns is not None:
+        detail["availability_timestamp_ns"] = int(availability_timestamp_ns)
     return json.dumps(detail, allow_nan=False, separators=(",", ":"))
 
 

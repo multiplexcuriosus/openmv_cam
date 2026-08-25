@@ -186,6 +186,8 @@ class OpenMVEventCamNode(Node):
             "/openmv_cam/event_tracker/ball_velocity_px_s")
         self.declare_parameter(
             "event_tracker_valid_topic", "/openmv_cam/event_tracker/valid")
+        self.declare_parameter(
+            "event_tracker_update_topic", "/openmv_cam/event_tracker/update")
         self.declare_parameter("event_tracker_bin_ms", 1.0)
         self.declare_parameter("event_tracker_accumulation_window_ms", 3.0)
         self.declare_parameter("event_tracker_history_limit_ms", 100.0)
@@ -342,6 +344,7 @@ class OpenMVEventCamNode(Node):
         self.event_tracker_position_pub = None
         self.event_tracker_velocity_pub = None
         self.event_tracker_valid_pub = None
+        self.event_tracker_update_pub = None
         self.event_tracker_debug_pub = None
         self.event_tracker_debug_stage_pubs = {}
         self.event_tracker_debug_event_frame_pub = None
@@ -356,6 +359,9 @@ class OpenMVEventCamNode(Node):
             tracker_debug_enabled and bool(self.get_parameter(
                 "event_tracker_debug_event_frame_enabled").value))
         if self.event_tracker_enabled:
+            from openmv_cam.msg import EventTrackerUpdate
+
+            self.EventTrackerUpdate = EventTrackerUpdate
             self.event_tracker = EventBallTracker(
                 width=self.W, height=self.H,
                 bin_ms=float(self.get_parameter("event_tracker_bin_ms").value),
@@ -420,6 +426,10 @@ class OpenMVEventCamNode(Node):
                 10)
             self.event_tracker_valid_pub = self.create_publisher(
                 Bool, str(self.get_parameter("event_tracker_valid_topic").value),
+                10)
+            self.event_tracker_update_pub = self.create_publisher(
+                self.EventTrackerUpdate,
+                str(self.get_parameter("event_tracker_update_topic").value),
                 10)
             self.event_tracker_stats_timer = self.create_timer(
                 self.event_tracker_stats_period_sec, self._event_tracker_stats_cb)
@@ -1458,15 +1468,40 @@ class OpenMVEventCamNode(Node):
         detections = self.event_tracker.update(packet)
         for detection in detections:
             self._tracker_trace_sequence += 1
+            availability_time = self.get_clock().now()
+            availability_ns = int(availability_time.nanoseconds)
+            availability_stamp = availability_time.to_msg()
+            update = self.EventTrackerUpdate()
+            update.header.stamp = availability_stamp
+            update.header.frame_id = "openmv_cam"
+            update.tracker_update_id = detection.tracker_update_id
+            update.tracker_update_id_valid = True
+            update.source_packet_id = detection.source_packet_id
+            update.source_packet_id_valid = detection.source_packet_id_valid
+            update.availability_timestamp_ns = availability_ns
+            update.sensor_window_start_us = detection.window_start_us
+            update.sensor_window_end_us = detection.window_end_us
+            update.x_px = detection.x_px
+            update.y_px = detection.y_px
+            update.vx_px_s = detection.vx_px_s
+            update.vy_px_s = detection.vy_px_s
+            update.valid = detection.valid
+            update.rejection_reason = detection.rejection_reason
+            update.candidate_count = detection.candidate_count
+            update.window_event_count = detection.window_event_count
+            update.confidence = detection.confidence
+            update.velocity_valid = detection.velocity_valid
+            self.event_tracker_update_pub.publish(update)
             if detection.valid:
-                stamp = self.get_clock().now().to_msg()
                 position = PointStamped()
-                position.header.stamp = stamp
+                # Legacy header stamp remains host result-availability time.
+                position.header.stamp = availability_stamp
                 position.header.frame_id = "openmv_cam"
                 position.point.x = detection.x_px
                 position.point.y = detection.y_px
                 velocity = Vector3Stamped()
-                velocity.header.stamp = stamp
+                # It is not a GenX320 sensor timestamp or exposure time.
+                velocity.header.stamp = availability_stamp
                 velocity.header.frame_id = "openmv_cam"
                 velocity.vector.x = detection.vx_px_s
                 velocity.vector.y = detection.vy_px_s
@@ -1486,11 +1521,12 @@ class OpenMVEventCamNode(Node):
                 start_steady_ns=detection.start_steady_ns,
                 end_steady_ns=detection.end_steady_ns, valid=detection.valid,
                 scalar_value=detection.confidence,
-                detail_json=self._tracker_completion_detail(packet, detection))
+                detail_json=self._tracker_completion_detail(
+                    packet, detection, availability_ns))
 
     @staticmethod
-    def _tracker_completion_detail(packet, detection):
-        detail = json.loads(trace_detail_json(detection))
+    def _tracker_completion_detail(packet, detection, availability_ns):
+        detail = json.loads(trace_detail_json(detection, availability_ns))
         detail["source"] = packet.source
         detail["packet_index"] = int(packet.packet_id)
         if packet.source == "hdf5_replay":
@@ -1515,13 +1551,25 @@ class OpenMVEventCamNode(Node):
                 "spatial_filter_removed_components",
                 "spatial_filter_removed_component_pixels")
         counts = " ".join(f"{key}={stats.get(key, 0)}" for key in keys)
+        rejections = ",".join(
+            f"{reason}:{count}" for reason, count in
+            sorted(stats["rejection_counts"].items())) or "none"
         self.get_logger().info(
             "EVENT TRACKER STATS | " + counts +
+            f" tracker_window_updates={stats.get('window_updates', 0)}"
+            f" valid_updates={stats.get('valid_detections', 0)}"
+            f" invalid_updates={stats.get('invalid_detections', 0)}"
+            f" source_packet_gaps={stats.get('source_packet_gaps', 0)}"
+            f" rejection_counts={rejections}"
             f" event_rate_hz={stats['event_rate_hz']:.1f}"
             f" processed_bin_rate_hz={stats['processed_bin_rate_hz']:.2f}"
             f" window_update_rate_hz={stats['window_update_rate_hz']:.2f}"
+            f" tracker_update_rate_hz={stats['tracker_update_rate_hz']:.2f}"
             f" valid_detection_rate_hz="
-            f"{stats['valid_detection_rate_hz']:.2f} " + timings)
+            f"{stats['valid_detection_rate_hz']:.2f}"
+            f" valid_update_rate_hz={stats['valid_update_rate_hz']:.2f}"
+            f" invalid_update_rate_hz={stats['invalid_update_rate_hz']:.2f} " +
+            timings)
 
     def _event_tracker_debug_timer_cb(self):
         snapshot = self.event_tracker.latest_debug_snapshot()
